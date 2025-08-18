@@ -17,6 +17,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.base import ClassifierMixin
 try:
     from tensorflow.keras.callbacks import (
         ModelCheckpoint,
@@ -63,7 +64,15 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s:%(levelname)s:%(message)s'
 )
-logger = logging.getLogger(__name__) 
+logger = logging.getLogger(__name__)
+
+# Custom exceptions
+class DLLLoadError(RuntimeError):
+    """Raised when the DLL cannot be loaded."""
+
+
+class InsufficientDataError(RuntimeError):
+    """Raised when the dataset is insufficient for training."""
 
 # 🔐 Seed for reproducibility
 np.random.seed(42)
@@ -156,10 +165,14 @@ def load_dll(path: str):
         return cd
     except Exception as e:
         logger.error("DLL load error: %s", e)
-        sys.exit(1)
+        raise DLLLoadError(str(e)) from e
 
 DLL_PATH = r"C:\Users\ACE\OneDrive - Khon Kaen University\Desktop\MyLibrary\x64\Debug\MyLibrary.dll"
-DLL = load_dll(DLL_PATH)
+try:
+    DLL = load_dll(DLL_PATH)
+except DLLLoadError as e:
+    logger.error("DLL not loaded: %s", e)
+    DLL = None
 
 def get_account_balance() -> float:
     info = mt5.account_info()
@@ -270,8 +283,8 @@ def calculate_support_resistance(df: pd.DataFrame, window: int = 20) -> pd.DataF
     return df
 
 def add_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
-    # อาจรวม Garman-Klass, Parkinson, ATR (ซึ่ง ATR คือตัวเดิม), plus rolling std
-    df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+    # อาจรวม Garman-Klass, Parkinson, และ ATR-based volatility (ATR_vol) โดยไม่ทับคอลัมน์ ATR เดิม
+    df['ATR_vol'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
     df['HistVol_10'] = df['close'].rolling(window=10).std()
     df['GK_vol'] = 0.5 * (np.log(df['high'] / df['low'])**2) - (2*np.log(2)-1)*(np.log(df['close']/df['open'])**2)
     df['Parkinson_vol'] = (1/(4*np.log(2))) * (np.log(df['high']/df['low'])**2)
@@ -473,7 +486,7 @@ def check_dataset_sufficiency(df: pd.DataFrame, look_back: int, hold_bars: int, 
     logger.info(f"Dataset check: need ≥{required}, have {avail}")
     if avail < required:
         logger.error(f"❌ Insufficient data: {avail} < {required}")
-        sys.exit(1)
+        raise InsufficientDataError(f"insufficient data: {avail} < {required}")
 
 # ==================================
 # 🧠 Section 4: Model Builders
@@ -696,12 +709,11 @@ def build_xgb_model(n_classes: int = 3) -> xgb.XGBClassifier:
 def get_base_predictions(models, X, rf_model=None, batch_size=64):
     """
     Predict โดยแบ่งเป็น batch ย่อยเพื่อลด footprint ของ GPU memory
-    แล้ว clear_session หลังจากแต่ละโมเดล
     """
     preds = []
     # 1) พยากรณ์แต่ละโมเดลทีละ batch
     for idx, m in enumerate(models):
-        if hasattr(m, 'predict'):
+        if isinstance(m, ClassifierMixin):
             # sklearn model
             arr = m.predict(X)
         else:
@@ -727,9 +739,6 @@ def get_base_predictions(models, X, rf_model=None, batch_size=64):
     # 3) ตัดทุกอาร์เรย์ให้มีจำนวนแถวเท่ากัน (min_n)
     min_n = min(p.shape[0] for p in preds)
     preds = [p if p.ndim==2 else p.reshape(-1,1) for p in preds]
-
-    K.clear_session()
-    gc.collect()
     return np.concatenate(preds, axis=1)
 
 # ============================================
@@ -742,88 +751,68 @@ from tensorflow.keras.callbacks import EarlyStopping
 import shap
 
 # 🔁 Tuning TCN
-def tune_tcn(X, y, look_back: int, pbounds=None):
-    if pbounds is None:
-        pbounds = {'filters': (16, 128), 'kernel': (2, 8)}
+def _best_val_acc(hist):
+    for k in ('val_accuracy','val_sparse_categorical_accuracy','val_acc'):
+        if k in hist: return float(np.max(hist[k]))
+    raise KeyError("No validation accuracy key found")
 
-    y_lbl = np.argmax(y, axis=1)
+def _to_label_1d(y):
+    y = np.asarray(y)
+    if y.ndim == 2:
+        y = y.reshape(-1) if y.shape[1] == 1 else np.argmax(y, axis=1)
+    return y.astype(np.int32)
+
+def tune_tcn(X, y, look_back, pbounds=None):
+    if pbounds is None:
+        pbounds = {'filters': (16,128), 'kernel': (2,8)}
+    X = np.asarray(X, dtype=np.float32)
+    y_lbl = _to_label_1d(y)
+    tscv = TimeSeriesSplit(n_splits=3)
 
     def cv(filters, kernel):
-        K.clear_session()
-        gc.collect()
-
-        model = build_model_tcn(
-            look_back, X.shape[2],
-            filters=int(filters),
-            kernel_size=int(kernel)
-        )
-
-        es = EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True)
-        h = model.fit(
-            X, y_lbl,
-            validation_split=0.2,
-            epochs=10,
-            batch_size=64,
-            callbacks=[es],
-            verbose=0
-        )
-        return max(h.history['val_accuracy'])
+        filters = int(filters); kernel = int(kernel)
+        kernel = max(2, min(kernel, look_back))
+        vals = []
+        for tr, va in tscv.split(X):
+            K.clear_session(); gc.collect()
+            m = build_model_tcn(look_back, X.shape[2], filters=filters, kernel_size=kernel)
+            # ต้อง compile ใน build_model_tcn ตามข้อ (1)
+            es = EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True)
+            h = m.fit(X[tr], y_lbl[tr], validation_data=(X[va], y_lbl[va]),
+                      epochs=10, batch_size=64, shuffle=False, callbacks=[es], verbose=0)
+            vals.append(_best_val_acc(h.history))
+        return float(np.mean(vals))
 
     opt = BayesianOptimization(f=cv, pbounds=pbounds, random_state=42)
     opt.maximize(init_points=5, n_iter=10)
     logger.info("✅ TCN tuning done: %s", opt.max)
     return opt.max['params']
 
-def tune_tft(X, y, look_back: int, pbounds=None):
+def tune_tft(X, y, look_back, pbounds=None):
     if pbounds is None:
-        pbounds = {
-            'ff_dim':    (64, 256),
-            'head_size': (16,  64),
-            'dropout':   (0.0,  0.5)
-        }
-
-    # 1) integer labels
-    y_lbl = np.argmax(y, axis=1)
-    # 2) float32 for Keras
+        pbounds = {'ff_dim': (64,256), 'head_size': (16,64), 'dropout': (0.0,0.5)}
     X = np.asarray(X, dtype=np.float32)
+    y_lbl = _to_label_1d(y)
+    tscv = TimeSeriesSplit(n_splits=3)
 
-    # 3) cv must accept (ff_dim, head_size, dropout)
     def cv(ff_dim, head_size, dropout):
-        K.clear_session()
-        gc.collect()
-
-        model = build_model_tft(
-            look_back  = look_back,
-            n_features = X.shape[2],
-            head_size  = int(head_size),
-            ff_dim     = int(ff_dim),
-            dropout    = float(dropout),   # <— now uses the argument
-            n_blocks   = 3,
-            num_heads  = 4
-        )
-
-        es = EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True)
-        tscv = TimeSeriesSplit(n_splits=3)
+        ff_dim = int(ff_dim); head_size = int(head_size); dropout = float(dropout)
         vals = []
-        for tr_idx, va_idx in tscv.split(X):
-            X_tr, X_va = X[tr_idx], X[va_idx]
-            y_tr, y_va = y_lbl[tr_idx], y_lbl[va_idx]
-            h = model.fit(
-                X_tr, y_tr,
-                validation_data=(X_va, y_va),
-                epochs=10,
-                batch_size=64,
-                callbacks=[es],
-                verbose=0
-            )
-            vals.append(max(h.history['val_accuracy']))
+        for tr, va in tscv.split(X):
+            K.clear_session(); gc.collect()
+            m = build_model_tft(look_back, X.shape[2],
+                                head_size=head_size, ff_dim=ff_dim,
+                                dropout=dropout, n_blocks=3, num_heads=4)
+            # ต้อง compile ใน build_model_tft ตามข้อ (1)
+            es = EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True)
+            h = m.fit(X[tr], y_lbl[tr], validation_data=(X[va], y_lbl[va]),
+                      epochs=10, batch_size=64, shuffle=False, callbacks=[es], verbose=0)
+            vals.append(_best_val_acc(h.history))
         return float(np.mean(vals))
 
-    # 4) now BO will pass dropout
     opt = BayesianOptimization(f=cv, pbounds=pbounds, random_state=42)
     opt.maximize(init_points=3, n_iter=5)
-
-    print("✅ TFT tuning done:", opt.max)
+    logger.info("✅ TFT tuning done: %s", opt.max)
     return opt.max['params']
 
 def explain_with_shap(model, X, feat_names, out_path: Optional[str] = None):
@@ -892,6 +881,7 @@ import numpy as np
 import pandas as pd
 import joblib
 import warnings
+import joblib, json, os
 import gc
 import keras_tuner as kt
 import xgboost as xgb
@@ -912,7 +902,7 @@ from tqdm import tqdm
 from tqdm.keras import TqdmCallback
 from tensorflow.keras.callbacks import CSVLogger
 from sklearn.base import BaseEstimator
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_score, fbeta_score
 from tensorflow.keras.models import load_model
 from tensorflow.keras.utils import custom_object_scope
 from tcn import TCN
@@ -923,8 +913,8 @@ from tensorflow.keras.callbacks import TensorBoard
 from xgboost import XGBClassifier
 from sklearn.utils import compute_class_weight
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
-from sklearn.metrics import confusion_matrix
 from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 
 # 🧠 Load all model builder functions
 # Assumes functions like build_model_lstm_att_hp, build_model_cnn_lstm etc. are defined elsewhere
@@ -1106,125 +1096,223 @@ def cross_validate_ea22(
     batch_size: int = 64,
     epochs: int = 10,
     n_splits: int = 5,
-    long_boost: float = 1.5       # สำหรับกระจายน้ำหนักคลาส Long
+    inner_splits: int = 3,
+    embargo: int | None = None,
+    long_boost: float = 1.0,
+    hold_band: float = 0.15
 ):
+    """
+    - purged TSS + embargo สำหรับ inner OOF ภายในชุด train ของแต่ละ fold (กัน leakage)
+    - meta เทรนบน OOF เท่านั้น
+    - calibrate P(Hold) ด้วย Platt (โลจิสติก) บน OOF เท่านั้น
+    - เลือก hold_thr โดยให้ coverage ใกล้สัดส่วนจริงใน fold (± hold_band)
+    """
+    if embargo is None:
+        embargo = look_back  # กันไว้ขั้นต่ำ
+
     y_lbl = np.argmax(y, axis=1)
     skf   = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     accs, f1_hold_list, f1_macro_list = [], [], []
 
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y_lbl), start=1):
-        print(f"\n[EA22 CV] Fold {fold}/{n_splits}")
-        X_tr, X_va = X[tr_idx], X[va_idx]
-        y_tr_lbl   = y_lbl[tr_idx]
-        y_va_lbl   = y_lbl[va_idx]
+        print(f"\n[EA22 CV] Fold {fold}/{n_splits} tr={len(tr_idx)} va={len(va_idx)}")
 
-        # 1) Train base deep models
-        trained = []
-        for build_fn in build_base_fns:
-            m = build_fn(look_back, X_tr.shape[2])
+        # ---------- สร้าง slice ของ fold นี้ ----------
+        X_tr, X_va  = X[tr_idx], X[va_idx]
+        y_tr_lbl    = y_lbl[tr_idx]
+        y_va_lbl    = y_lbl[va_idx]
+
+        # ---------- (1) OOF ด้านในบน tr_idx ด้วย purged_tss ----------
+        n_tr = len(X_tr)
+        oof_holder = None
+        filled = np.zeros(n_tr, dtype=bool)
+
+        for in_fold, (in_tr_idx, in_va_idx) in enumerate(
+            purged_tss(n_tr, n_splits=inner_splits, embargo=embargo), 1
+        ):
+            # base-in
+            base_in = []
+            for fn in build_base_fns:
+                m = fn(look_back, X_tr.shape[2])
+                m.fit(X_tr[in_tr_idx], y_tr_lbl[in_tr_idx],
+                      epochs=epochs, batch_size=batch_size, verbose=0)
+                base_in.append(m)
+
+            # RF-in
+            rf_in = build_rf_fn()
+            rf_in.fit(X_tr[in_tr_idx].reshape(len(in_tr_idx), -1), y_tr_lbl[in_tr_idx])
+
+            # meta features บน in_va_idx
+            meta_va = get_base_predictions(base_in, X_tr[in_va_idx],
+                                           rf_model=rf_in, batch_size=batch_size)
+
+            if oof_holder is None:
+                oof_holder = np.full((n_tr, meta_va.shape[1]), np.nan, dtype=np.float32)
+            oof_holder[in_va_idx] = meta_va
+            filled[in_va_idx] = True
+
+        if not filled.all():
+            dropped = int((~filled).sum())
+            print(f"[CV][OOF] drop {dropped}/{n_tr} rows ({dropped/n_tr:.2%}) due to embargo/split edges.")
+
+        # ใช้เฉพาะแถวที่มี OOF จริงมาเทรน meta
+        mask_fit       = filled
+        meta_X_tr_oof  = oof_holder[mask_fit]
+        y_meta_tr_fit  = y_tr_lbl[mask_fit]
+
+        row_ok = ~np.any(np.isnan(meta_X_tr_oof), axis=1)
+        meta_X_tr_oof = meta_X_tr_oof[row_ok]
+        y_meta_tr_fit = y_meta_tr_fit[row_ok]
+
+        # ---------- (2) base_full & rf_full บน tr_idx ทั้งก้อน (ใช้ predict X_va) ----------
+        base_full = []
+        for fn in build_base_fns:
+            m = fn(look_back, X_tr.shape[2])
             m.fit(X_tr, y_tr_lbl, epochs=epochs, batch_size=batch_size, verbose=0)
-            trained.append(m)
+            base_full.append(m)
 
-        # 2) Train RF
-        rf = build_rf_fn()
-        rf.fit(X_tr.reshape(len(X_tr), -1), y_tr_lbl)
+        rf_full = build_rf_fn()
+        rf_full.fit(X_tr.reshape(len(X_tr), -1), y_tr_lbl)
 
-        # 3) สร้าง meta-inputs
-        meta_X_tr = get_base_predictions(trained, X_tr, rf_model=rf, batch_size=batch_size)
-        meta_X_va = get_base_predictions(trained, X_va, rf_model=rf, batch_size=batch_size)
+        meta_X_va = get_base_predictions(base_full, X_va, rf_model=rf_full, batch_size=batch_size)
 
-        # 4) เตรียม class_weight_meta + boost คลาส Long (2)
-        classes_meta = np.unique(y_tr_lbl)
-        cw_vals      = compute_class_weight('balanced', classes=classes_meta, y=y_tr_lbl)
-        class_weight_meta = {int(c): float(w) for c,w in zip(classes_meta, cw_vals)}
-        class_weight_meta.setdefault(2, 1.0)
+        # ---------- (3) ฝึก meta บน OOF เท่านั้น ----------
+        classes_meta = np.unique(y_meta_tr_fit)
+        cw_vals = compute_class_weight('balanced', classes=classes_meta, y=y_meta_tr_fit)
+        class_weight_meta = {int(c): float(w) for c, w in zip(classes_meta, cw_vals)}
+        for c in [0, 1, 2]:
+            class_weight_meta.setdefault(c, 1.0)
         class_weight_meta[2] *= long_boost
-        print("  class_weight_meta:", class_weight_meta)
 
-        # 5) Train meta-model
-        meta = build_meta_fn(input_dim=meta_X_tr.shape[1])
+        meta = build_meta_fn(input_dim=meta_X_tr_oof.shape[1])
         meta.compile(optimizer=Adam(1e-4),
                      loss='sparse_categorical_crossentropy',
                      metrics=['accuracy'])
-        meta.fit(meta_X_tr, y_tr_lbl,
-                 epochs=epochs,
-                 batch_size=batch_size,
-                 class_weight=class_weight_meta,
-                 verbose=0)
+        meta.fit(meta_X_tr_oof, y_meta_tr_fit,
+                 epochs=epochs, batch_size=batch_size,
+                 class_weight=class_weight_meta, verbose=0)
 
-        # ---- Calibration (Isotonic) ----
-        prob_tr   = meta.predict(meta_X_tr)       # shape=(n_tr,3)
-        P_hold_tr = prob_tr[:, 1]
-        y_hold_tr = (y_tr_lbl == 1).astype(int)
+        # ---------- (4) Calibrate บน OOF (Platt) ----------
+        probs_tr   = meta.predict(meta_X_tr_oof, verbose=0)
+        P_hold_tr  = probs_tr[:, 1]
+        y_hold_tr  = (y_meta_tr_fit == 1).astype(int)
 
-        # ถ้ามีทั้ง Hold และ non-Hold ในชุดฝึก จึง calibrate
-        if len(np.unique(y_hold_tr)) == 2:
-            # 1) กรอง NaN ออกจาก P_hold_tr
-            mask     = ~np.isnan(P_hold_tr)
-            P_clean  = P_hold_tr[mask]
-            y_clean  = y_hold_tr[mask]
-            # 2) Fit isotonic
-            iso      = IsotonicRegression(out_of_bounds='clip')
-            iso.fit(P_clean, y_clean)
-            # 3) สร้างฟังก์ชันช่วยกรอง/เติม NaN แล้ว predict
-            def calibrate(p):
-                # แทน NaN ด้วยค่า 0.5 แล้วค่อย predict
-                p2 = np.nan_to_num(p, nan=0.5)
-                return iso.predict(p2)
+        mask = ~np.isnan(P_hold_tr)
+        P_fit = np.asarray(P_hold_tr[mask], dtype=np.float64)
+        y_fit = np.asarray(y_hold_tr[mask], dtype=np.int32)
+
+        cal_kind, cal_obj = "identity", None
+        if np.unique(y_fit).size == 2 and (y_fit==0).sum()>=20 and (y_fit==1).sum()>=20:
+        # guard: ถ้า variance ของ P_fit แทบเป็นศูนย์ ให้ข้าม calibration
+            if np.std(P_fit) > 1e-6:
+                iso = IsotonicRegression(out_of_bounds='clip').fit(P_fit, y_fit)
+                lr  = LogisticRegression(solver='lbfgs', max_iter=1000).fit(P_fit.reshape(-1,1), y_fit)
+                brier_iso = np.mean((iso.predict(P_fit)-y_fit)**2)
+                brier_lr  = np.mean((lr.predict_proba(P_fit.reshape(-1,1))[:,1]-y_fit)**2)
+                cal_kind, cal_obj = ("iso", iso) if brier_iso <= brier_lr else ("platt", lr)
+
+        def calibrate(p):
+            p = np.nan_to_num(np.asarray(p, dtype=np.float64), nan=0.5)
+            if cal_kind == "iso":
+                return np.clip(cal_obj.predict(p), 0.0, 1.0)
+            if cal_kind == "platt":
+                return np.clip(cal_obj.predict_proba(p.reshape(-1,1))[:,1], 0.0, 1.0)
+            return np.clip(p, 0.0, 1.0)
+
+        # ---------- (5) Predict/threshold บน va_idx ----------
+        probs_va = meta.predict(meta_X_va, verbose=0)
+        p0 = np.nan_to_num(probs_va[:, 0], nan=0.0)
+        p2 = np.nan_to_num(probs_va[:, 2], nan=0.0)
+        other_pred_va = np.where(p0 >= p2, 0, 2)
+
+        P_hold_cal = calibrate(probs_va[:, 1])
+
+        # ============== เลือก hold_thr ให้คุม coverage + ดีต่อ F1(Hold) ==============
+        y_true = y_va_lbl
+        y_hold_bin = (y_true == 1).astype(int)
+
+        target_hold = float((y_true == 1).mean())
+        band = hold_band  # e.g. 0.15
+        low_frac  = max(0.0, target_hold * (1 - band))
+        high_frac = min(1.0, target_hold * (1 + band))
+
+        P = np.asarray(P_hold_cal, dtype=np.float64)
+
+        print(f"  DEBUG: low={low_frac:.2%} high={high_frac:.2%} "
+              f"min={P.min():.3f} p25={np.percentile(P,25):.3f} "
+              f"p50={np.percentile(P,50):.3f} p75={np.percentile(P,75):.3f} max={P.max():.3f}")
+
+        n = len(P)
+        # สร้างกริด threshold ที่ทำให้ coverage อยู่ในช่วง [low, high]
+        q_low  = 1.0 - high_frac
+        q_high = 1.0 - low_frac
+        if q_low > q_high:
+            q_low, q_high = q_high, q_low
+
+        qs = np.linspace(q_low, q_high, 31)  # 31 candidates ในช่วงที่ coverage เข้าเงื่อนไข
+        cand_thrs = np.unique(np.quantile(P, qs))
+
+        best = None
+        for thr in cand_thrs:
+            cov = (P > thr).mean()
+            # เผื่อกรณีค่าซ้ำเยอะ → ดัน threshold เล็กน้อยให้เข้าเป้า
+            if cov < low_frac - 1e-6:
+                # ลด threshold เพื่อเพิ่ม coverage
+                thr = np.nextafter(thr, -np.inf)
+                cov = (P > thr).mean()
+            elif cov > high_frac + 1e-6:
+                # เพิ่ม threshold เพื่อลด coverage
+                thr = np.nextafter(thr, +np.inf)
+                cov = (P > thr).mean()
+
+            if low_frac - 1e-6 <= cov <= high_frac + 1e-6:
+                pred_hold = (P > thr).astype(int)
+                f1h = f1_score(y_hold_bin, pred_hold, zero_division=0)
+                # จะใส่ penalty จาก |cov-target| ก็ได้ เช่น f1h - 0.05*abs(cov-target_hold)
+                score = f1h
+                if (best is None) or (score > best[0]):
+                    best = (score, float(thr), float(cov))
+
+        # fallback: ถ้าไม่มี candidate เข้า band (เช่น distribution แปลกมาก)
+        if best is None:
+            # เอาค่าใกล้ target ที่สุด
+            thr_target = float(np.quantile(P, 1.0 - target_hold))
+            # ดันเข้าขอบถ้าหลุด
+            cov0 = (P > thr_target).mean()
+            if cov0 < low_frac:
+                hold_thr = float(np.quantile(P, 1.0 - low_frac))
+            elif cov0 > high_frac:
+                hold_thr = float(np.quantile(P, 1.0 - high_frac))
+            else:
+                hold_thr = thr_target
+            cov = (P > hold_thr).mean()
         else:
-            # ถ้าไม่มีทั้งสองคลาส ให้ข้าม calibration
-            def calibrate(p):
-                # แค่เติม NaN เป็น 0.5 แล้วคืน p ดิบ
-                return np.nan_to_num(p, nan=0.5)
+            hold_thr, cov = best[1], best[2]
 
-        # ---- ใช้ calibrate เวลาพยากรณ์ ----
-        prob_va    = meta.predict(meta_X_va)
-        raw_hold   = prob_va[:, 1]
-        P_hold_cal = calibrate(raw_hold)
-
-        # ---- หา optimal threshold ด้วย F1-macro ----
-        y_true      = y_va_lbl
-        best_thr, best_f1m = 0.0, 0.0
-        for thr in np.linspace(0.30, 0.60, 301):
-            y_pred_thr = np.where(
-                P_hold_cal > thr,
-                1,
-                np.argmax(prob_va, axis=1)
-            )
-            f1m = f1_score(y_true, y_pred_thr, average='macro')
-            if f1m > best_f1m:
-                best_f1m, best_thr = f1m, thr
-
-        print(f"  best_hold_thr={best_thr:.6f}, F1-macro={best_f1m:.4f}")
-
-        # ---- ประเมินด้วย threshold ที่หาได้ ----
-        y_pred = np.where(P_hold_cal > best_thr,
-                          1,
-                          np.argmax(prob_va, axis=1))
+        # ============== ใช้ threshold ที่ได้ ==============
+        y_pred = np.where(P > hold_thr, 1, other_pred_va).astype(int)
 
         acc      = accuracy_score(y_true, y_pred)
-        f1_hold  = f1_score(y_true, y_pred, labels=[1], average='macro')
-        f1_macro = f1_score(y_true, y_pred, average='macro')
+        f1_hold  = f1_score(y_true, y_pred, labels=[1], average='macro', zero_division=0)
+        f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
 
-        print(f"  accuracy: {acc:.4f}, F1-Hold: {f1_hold:.4f}, F1-macro: {f1_macro:.4f}")
+        print(f"  hold_thr={hold_thr:.3f} (target={target_hold:.2%}, "
+              f"pred≈{cov:.2%}, band=[{low_frac:.2%},{high_frac:.2%}])"
+              f" -> acc={acc:.4f}, F1(Hold)={f1_hold:.4f}, F1-macro={f1_macro:.4f}")
         print("  Confusion Matrix:")
         print(confusion_matrix(y_true, y_pred, labels=[0,1,2]))
 
-        accs.append(acc)
-        f1_hold_list.append(f1_hold)
-        f1_macro_list.append(f1_macro)
+        accs.append(acc); f1_hold_list.append(f1_hold); f1_macro_list.append(f1_macro)
 
-        # เคลียร์ memory
+        # ---------- เคลียร์กราฟ/เมมโมรีต่อ fold ----------
         from tensorflow.keras import backend as K
-        import gc
-        K.clear_session()
-        gc.collect()
+        import gc; K.clear_session(); gc.collect()
 
-    print(f"\n[EA22 CV] Mean accuracy : {np.mean(accs):.4f} ± {np.std(accs):.4f}")
+    # ---------- สรุป ----------
+    print(f"[EA22 CV] Mean accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
     print(f"[EA22 CV] Mean F1-Hold  : {np.mean(f1_hold_list):.4f} ± {np.std(f1_hold_list):.4f}")
     print(f"[EA22 CV] Mean F1-macro : {np.mean(f1_macro_list):.4f} ± {np.std(f1_macro_list):.4f}")
-
     return accs, f1_hold_list, f1_macro_list
 
 def find_threshold_by_grid(
@@ -1334,18 +1422,19 @@ def get_class_weights(y):
 
 def weighted_cce_loss(weight_vector):
     """
-    weight_vector: 1D array หรือ list ของน้ำหนักแต่ละคลาส [w0, w1, w2]
-    คืนฟังก์ชัน loss ที่ scale cross‐entropy ด้วย weight per sample
+    weight_vector: ลิสต์/อาเรย์น้ำหนักต่อคลาส [w0, w1, w2]
+    คืนค่า loss ที่เป็น CCE * weight ต่อ sample
     """
-    # แปลงเป็น tensor ค้างไว้
-    weights = tf.constant(weight_vector, dtype=tf.float32)
+    # บังคับให้เป็น float32 ตั้งแต่ต้น (กัน float64 จาก numpy)
+    w_f32 = tf.constant(weight_vector, dtype=tf.float32)
+
     def loss(y_true, y_pred):
-        # ปกติ categorical_crossentropy จะคืน shape=(batch,)
-        cce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
-        # คำนวณ weight ต่อ sample ด้วย dot product ระหว่าง one-hot y_true กับ weights
-        sample_weights = tf.reduce_sum(y_true * weights, axis=1)
-        # scale loss
-        return cce * sample_weights
+        dtype = y_pred.dtype
+        w   = tf.cast(w_f32, dtype)
+        y_t = tf.cast(y_true, dtype)
+        cce = tf.keras.losses.categorical_crossentropy(y_t, y_pred)
+        samp_w = tf.reduce_sum(y_t * w, axis=1)
+        return cce * samp_w
     return loss
 
 def sparse_focal_loss(gamma=2.0, alpha=0.25):
@@ -1412,10 +1501,7 @@ def build_stage1_model(input_shape):
         LSTM(64, return_sequences=False, kernel_regularizer=l2(0.01)),
         Dense(2, activation='softmax')
     ])
-    model.compile(
-        optimizer='adam',
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
+    model.compile(optimizer='adam',loss='sparse_categorical_crossentropy',metrics=['accuracy']
     )
     return model
 
@@ -1426,11 +1512,7 @@ def build_stage2_model(input_shape):
         Dropout(0.5),
         Dense(2, activation='softmax', kernel_regularizer=l2(1e-4))
     ])
-    model.compile(
-        optimizer=Adam(learning_rate=1e-4),
-        loss=sparse_focal_loss(gamma=2.0, alpha=0.25),  # <— ใช้ sparse version
-        metrics=['accuracy']
-    )
+    model.compile(optimizer=Adam(learning_rate=1e-4),loss=sparse_focal_loss(gamma=2.0, alpha=0.25),metrics=['accuracy'])
     return model
 
 def find_threshold_by_bisect(
@@ -1536,48 +1618,191 @@ def find_threshold_for_long(
     return None, best_thr
 
 class MacroF1(tf.keras.metrics.Metric):
-    def __init__(self, num_classes=3, name='macro_f1', **kwargs):
-        super().__init__(name=name, **kwargs)
+    def __init__(self, num_classes=3, name="macro_f1", dtype=tf.float32, **kwargs):
+        super().__init__(name=name, dtype=dtype, **kwargs)
         self.num_classes = num_classes
-        # ใส่ name ให้ add_weight แต่ละตัว
-        self.tp = self.add_weight(
-            name='tp',
-            shape=(num_classes,),
-            initializer='zeros'
-        )
-        self.fp = self.add_weight(
-            name='fp',
-            shape=(num_classes,),
-            initializer='zeros'
-        )
-        self.fn = self.add_weight(
-            name='fn',
-            shape=(num_classes,),
-            initializer='zeros'
-        )
+        # เก็บสถิติเป็นเวกเตอร์ต่อคลาส แล้วค่อย assign_add ทีเดียว
+        self.tp = self.add_weight(name="tp", shape=(num_classes,), initializer="zeros", dtype=dtype)
+        self.fp = self.add_weight(name="fp", shape=(num_classes,), initializer="zeros", dtype=dtype)
+        self.fn = self.add_weight(name="fn", shape=(num_classes,), initializer="zeros", dtype=dtype)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_pred_labels = tf.argmax(y_pred, axis=1, output_type=tf.int32)
-        y_true = tf.cast(y_true, tf.int32)
-        for i in range(self.num_classes):
-            true_i = tf.equal(y_true, i)
-            pred_i = tf.equal(y_pred_labels, i)
-            tp = tf.reduce_sum(tf.cast(tf.logical_and(true_i, pred_i), self.dtype))
-            fp = tf.reduce_sum(tf.cast(tf.logical_and(~true_i, pred_i), self.dtype))
-            fn = tf.reduce_sum(tf.cast(tf.logical_and(true_i, ~pred_i), self.dtype))
-            self.tp[i].assign_add(tp)
-            self.fp[i].assign_add(fp)
-            self.fn[i].assign_add(fn)
+        # รองรับทั้ง one-hot และ sparse
+        if y_true.shape.rank == 2 and y_true.shape[-1] == self.num_classes:
+            y_true_int = tf.argmax(y_true, axis=-1)
+        else:
+            y_true_int = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+
+        y_pred_int = tf.argmax(y_pred, axis=-1)
+
+        # one-hot ทั้งสองอัน
+        y_true_oh = tf.one_hot(y_true_int, depth=self.num_classes, dtype=self.dtype)
+        y_pred_oh = tf.one_hot(y_pred_int, depth=self.num_classes, dtype=self.dtype)
+
+        # คำนวณเวกเตอร์ tp/fp/fn ต่อคลาส
+        tp = tf.reduce_sum(y_true_oh * y_pred_oh, axis=0)                  # (C,)
+        fp = tf.reduce_sum((1.0 - y_true_oh) * y_pred_oh, axis=0)          # (C,)
+        fn = tf.reduce_sum(y_true_oh * (1.0 - y_pred_oh), axis=0)          # (C,)
+
+        # อัปเดตสถานะด้วย assign_add ทีละเวกเตอร์
+        self.tp.assign_add(tp)
+        self.fp.assign_add(fp)
+        self.fn.assign_add(fn)
 
     def result(self):
-        precision = tf.math.divide_no_nan(self.tp, self.tp + self.fp)
-        recall    = tf.math.divide_no_nan(self.tp, self.tp + self.fn)
-        f1 = 2 * precision * recall / tf.math.maximum(precision + recall, 1e-8)
-        return tf.reduce_mean(f1)
+        eps = tf.constant(1e-7, dtype=self.dtype)
+        precision = self.tp / (self.tp + self.fp + eps)
+        recall    = self.tp / (self.tp + self.fn + eps)
+        f1_per_c  = 2.0 * precision * recall / (precision + recall + eps)
+        return tf.reduce_mean(f1_per_c)
 
     def reset_states(self):
         for v in self.variables:
             v.assign(tf.zeros_like(v))
+
+def purged_tss(n_samples, n_splits=5, embargo=0):
+    """
+    TimeSeriesSplit แบบ purge/embargo:
+    - train อยู่ก่อน, val อยู่หลัง
+    - ตัด train ส่วนปลายให้ห่าง val ต้นด้วยระยะ embargo
+    คืนรายการ (train_idx, val_idx)
+    """
+    tss = TimeSeriesSplit(n_splits=n_splits)
+    for tr_idx, va_idx in tss.split(np.arange(n_samples)):
+        cut = max(0, va_idx[0] - embargo)
+        tr_idx = tr_idx[tr_idx < cut]
+        yield tr_idx, va_idx
+
+def build_and_fit_base(fn, X_tr, y_tr, X_va=None, y_va=None,
+                       lr=1e-4, batch_size=64, epochs=10):
+    m = fn(X_tr.shape[1], X_tr.shape[2])  # (look_back, n_features)
+    # ฝึก base models ด้วย sparse (ส่ง label เป็น 1D)
+    m.compile(optimizer=Adam(learning_rate=lr),
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
+    if X_va is not None and y_va is not None:
+        m.fit(X_tr, y_tr, validation_data=(X_va, y_va),
+              epochs=epochs, batch_size=batch_size, shuffle=False, verbose=0)
+    else:
+        m.fit(X_tr, y_tr, epochs=epochs, batch_size=batch_size,
+              shuffle=False, verbose=0)
+    return m
+
+def _to_label_1d(y):
+    y = np.asarray(y)
+    if y.ndim == 2:
+        if y.shape[1] == 1:
+            y = y.reshape(-1)
+        else:
+            y = np.argmax(y, axis=1)
+    return y.astype(np.int32)
+
+def make_oof_meta_features(
+    X_tr, y_tr_onehot,
+    build_base_fns,                # ลำดับต้อง “เหมือนตอนเทรนจริง”
+    rf_builder,                    # ฟังก์ชันสร้าง RF เช่น build_rf_model
+    look_back, batch_size, epochs,
+    n_splits=4, embargo=None
+):
+    y_tr_lbl = _to_label_1d(y_tr_onehot)
+    n = len(X_tr)
+
+    if embargo is None:
+        # ค่าปริยาย: กันอย่างน้อยเท่ากับ look_back (ถ้าอยากเคร่งครัด ใส่ look_back+hold_bars จากภายนอก)
+        embargo = look_back
+
+    oof_holder = None
+    filled = np.zeros(n, dtype=bool)
+
+    # ทำ K-fold แบบ purged
+    folds = list(purged_tss(n, n_splits=n_splits, embargo=embargo))
+    for fold, (tr_idx, va_idx) in enumerate(folds, 1):
+        # 1) ฝึก base แต่ละตัวบน tr_idx แล้วพยากรณ์ va_idx
+        base_fold = []
+        for fn in build_base_fns:
+            m = build_and_fit_base(
+                fn,
+                X_tr[tr_idx], y_tr_lbl[tr_idx],
+                X_tr[va_idx], y_tr_lbl[va_idx],
+                batch_size=batch_size, epochs=epochs
+            )
+            base_fold.append(m)
+
+        # 2) RF บน tr_idx
+        rf_fold = rf_builder()
+        rf_fold.fit(X_tr[tr_idx].reshape(len(tr_idx), -1), y_tr_lbl[tr_idx])
+
+        # 3) สร้าง meta-features บน va_idx
+        meta_va = get_base_predictions(
+            base_fold, X_tr[va_idx],
+            rf_model=rf_fold,
+            batch_size=batch_size
+        )
+        if oof_holder is None:
+            oof_holder = np.full((n, meta_va.shape[1]), np.nan, dtype=np.float32)
+        oof_holder[va_idx] = meta_va
+        filled[va_idx] = True
+
+    # ใช้เฉพาะแถวที่มี OOF ครบ (ไม่เป็น NaN)
+    if oof_holder is None:
+        raise RuntimeError("OOF holder was never initialized; check your folds/indices.")
+
+    valid_mask = filled & (~np.any(np.isnan(oof_holder), axis=1))
+    n_valid = int(valid_mask.sum())
+    if n_valid < n:
+        miss = n - n_valid
+        print(f"[OOF] Warning: drop {miss}/{n} rows ({miss/n:.1%}) w/out valid OOF due to embargo/split edges.")
+
+    meta_X_tr = oof_holder[valid_mask]
+    y_meta_tr = y_tr_lbl[valid_mask]
+
+    # 4) ฝึก base_full + rf_full บน train ทั้งก้อน (ไว้ทำนาย holdout/val)
+    base_full = []
+    for fn in build_base_fns:
+        m = build_and_fit_base(fn, X_tr, y_tr_lbl, None, None,
+                               batch_size=batch_size, epochs=epochs)
+        base_full.append(m)
+
+    rf_full = rf_builder()
+    rf_full.fit(X_tr.reshape(len(X_tr), -1), y_tr_lbl)
+
+    return meta_X_tr, y_meta_tr, base_full, rf_full
+
+def pick_gate(probs_gate, base_pred, y_true, long_mask, target_range=(0.15,0.30)):
+    rest_mask = ~long_mask
+    p = probs_gate[rest_mask]
+    top = p.max(axis=1)
+    second = np.partition(p, -2, axis=1)[:, -2]
+    margin = top - second
+
+    # กริดเริ่มค่อนข้างเข้ม และ "ไม่อนุญาต" margin=0
+    conf_grid   = np.linspace(np.quantile(top, 0.65), np.quantile(top, 0.85), 6)
+    margin_grid = np.linspace(0.04, 0.12, 5)   # <- ขั้นต่ำ 0.04
+
+    best = None
+    mid  = sum(target_range)/2
+    for c in conf_grid:
+        for m in margin_grid:
+            mask_rest = (top >= c) & (margin >= m)
+            eval_mask = long_mask.copy()
+            eval_mask[rest_mask] = mask_rest
+            cov = eval_mask.mean()
+            if not (target_range[0] <= cov <= target_range[1]):
+                continue
+            y_hat = base_pred.copy()
+            y_hat[rest_mask] = np.where(mask_rest, base_pred[rest_mask], 1).astype(int)
+            f1m = f1_score(y_true, y_hat, average='macro', zero_division=0)
+            score = (f1m, -abs(cov - mid))  # ดีสุด + ใกล้กลางช่วง
+            if (best is None) or (score > best[0]): best = (score, c, m, eval_mask)
+
+    if best is None:  # fallback นุ่มๆ
+        c = float(np.quantile(top, 0.70)); m = 0.06
+        mask_rest = (top >= c) & (margin >= m)
+        eval_mask = long_mask.copy(); eval_mask[rest_mask] = mask_rest
+        return c, m, eval_mask
+
+    _, c, m, eval_mask = best
+    return float(c), float(m), eval_mask
 
 # ====================================
 # 🔧 Configuration (วางที่นี่)
@@ -1585,7 +1810,7 @@ class MacroF1(tf.keras.metrics.Metric):
 CONFIG = {
     "symbol": "EURUSDm",
     "file_paths": {
-        "M5":  r"C:\\Users\\ACE\\EURUSDm_M5_7.csv",
+        "M5":  r"C:\\Users\\ACE\\EURUSDm_M5_8.csv",
         "M15": r"C:\\Users\\ACE\\EURUSDm_M15_6.csv",
         "H1":  r"C:\\Users\\ACE\\EURUSDm_H1_6.csv"
     },
@@ -1597,9 +1822,7 @@ CONFIG = {
         "epochs_ea22":      100,
         "epochs_ea27":      30,
         "tcn_tune_iters":   5,
-        "tft_tune_iters":   5
-    }
-}
+        "tft_tune_iters":   5}}
 
 # ─── Test consistency snippet ───
 file_path = CONFIG["file_paths"]["M5"]
@@ -1629,12 +1852,16 @@ def run_ea22():
     # 1) Load & feature‐engineering
     data = load_csv_data(paths)
     df = prepare_base_dataframe(paths["M5"], symbol, dfs_other={'M15': data['M15'], 'H1': data['H1']})
-    check_dataset_sufficiency(
-        df,
-        look_back  = params["look_back"],
-        hold_bars  = params["max_hold_period"],
-        min_trades = params["min_trades"]
-    )
+    try:
+        check_dataset_sufficiency(
+            df,
+            look_back=params["look_back"],
+            hold_bars=params["max_hold_period"],
+            min_trades=params["min_trades"]
+        )
+    except InsufficientDataError as e:
+        logger.error("EA22 aborted: %s", e)
+        return
 
     # 0) Detect regime แล้วเก็บไว้ใน df
     df['regime'] = detect_market_regime(df['close'].values, n_states=3)    
@@ -1649,14 +1876,18 @@ def run_ea22():
     features_ea22 = list(OrderedDict.fromkeys(features_ea22))
     print(f"EA22 features after dedupe: {len(features_ea22)} items")
 
+    look_back = CONFIG["parameters"]["look_back"]
+    hold_bars = CONFIG["parameters"]["max_hold_period"]
+
     #  ‒‒‒ หากมี NaN ให้ใช้ ffill/bfill แทน dropna() ‒‒‒
     X_raw_df = df[features_ea22].fillna(method='ffill').fillna(method='bfill')
     X_raw = X_raw_df.values
     print("X_raw.shape:", X_raw.shape)
 
     # 4) Scale เท่านั้น (ไม่ลดมิติ)
-    scaler = RobustScaler().fit(X_raw)
-    data_pca = scaler.transform(X_raw)   # ใช้ชื่อ data_pca ต่อเนื่องเพื่อไม่ต้องแก้ downstream
+    split_i = int(len(X_raw) * 0.8)
+    scaler = RobustScaler().fit(X_raw[:split_i])
+    data_pca = scaler.transform(X_raw).astype(np.float32)   # ใช้ชื่อ data_pca ต่อเนื่องเพื่อไม่ต้องแก้ downstream
     print("Using full feature set → data_pca.shape =", data_pca.shape)
 
     # บันทึก feature names, scaler, pca
@@ -1666,97 +1897,94 @@ def run_ea22():
     joblib.dump(scaler, "models/ea22/scaler22.pkl")
 
     prices = df['close'].values
-    returns = pd.Series(prices).pct_change().dropna().values
-    desired_hold = 0.20
-    tol = 0.005
+    lb     = params["look_back"]
+    hb     = params["max_hold_period"]
+    target = 0.25        # เล็ง 25% (จะได้ 20–30%)
 
-    max_thr = np.max(np.abs(returns))  # หรือช่วงสูงสุดที่ต้องการลอง
+    # 1) สร้างกรอบค้นหา threshold จาก distribution ของ forward return
+    fwd = prices[hb:] / prices[:-hb] - 1.0
+    lo  = 0.0
+    hi  = float(np.quantile(np.abs(fwd), 0.99))  # เพดานสมเหตุสมผล
 
-    # 1. หา thr_short (e.g. bisect/search เฉพาะ short)
-    thr_short, _ = find_threshold_for_short(
-        data_pca, prices,
-        look_back=params["look_back"],
-        hold_bars=params["max_hold_period"],
-        target_short_frac=0.20  # ตั้ง value ให้ชัดเจน
-    )
-    # 2. หา thr_long
-    _, thr_long = find_threshold_for_long(
-        data_pca, prices,
-        look_back=params["look_back"],
-        hold_bars=params["max_hold_period"],
-        target_long_frac=0.20
-    )
+    def make_labels(thr):
+        X_tmp, y_tmp = create_labels_from_price_nonzero(
+            data_pca, prices,
+            look_back=lb, hold_bars=hb,
+            thr_short=float(thr), thr_long=float(thr)
+        )
+        hold_frac = (np.argmax(y_tmp, axis=1) == 1).mean()
+        return X_tmp, y_tmp, hold_frac
 
-    # สร้าง X_tmp, y_tmp ด้วย threshold ที่ได้
-    X_tmp, y_tmp = create_labels_from_price_nonzero(
-        data_pca, prices,
-        look_back=params["look_back"],
-        hold_bars=params["max_hold_period"],
-        thr_short=thr_short,
-        thr_long=thr_long
-    )
-    hold_frac_final = np.mean(np.argmax(y_tmp, axis=1) == 1)
+    # 2) binary search หา thr ที่ให้ Hold ใกล้ target
+    best_thr = None
+    for _ in range(18):  # พอใกล้เคียงในไม่กี่รอบ
+        mid = (lo + hi) / 2
+        _, y_mid, hold_mid = make_labels(mid)
+        if hold_mid > target:
+            # Hold มากไป -> thr ใหญ่ไป -> ลดลง
+            hi = mid
+        else:
+            # Hold น้อยไป -> thr เล็กไป -> เพิ่มขึ้น
+            lo = mid
+        best_thr = mid
 
-    # สมมติหลังสร้าง X_tmp, y_tmp แล้ว:
-    n_samples, seq_len, n_feats = X_tmp.shape
-    labels_tmp = np.argmax(y_tmp, axis=1)
-    X_flat = X_tmp.reshape(n_samples, seq_len * n_feats)
-    y_labels = np.argmax(y_tmp, axis=1)
-    hold_count = np.sum(labels_tmp == 1)
-    X_sel_flat, top_idx = select_features_by_mutual_info(X_flat, y_labels, k=40)
+    # 3) ใช้ threshold ที่ได้จริงมาสร้างชุดสุดท้าย
+    X_tmp, y_tmp, hold_frac_all = make_labels(best_thr)
+    print(f"[LABEL] picked thr={best_thr:.6f} → Hold frac={hold_frac_all:.2%}")
 
-    print(f"Final Hold frac = {hold_count/len(labels_tmp):.2%} (target={desired_hold:.2%})")
-    print("Before oversample (all):", np.unique(labels_tmp, return_counts=True))
-
-    # ——————————————————————————————————————————
-    # 1) ถ้าไม่มี Hold เลยใน y_tmp → inject dummy Hold ก่อนแบ่ง train/val
-    if hold_count == 0:
-        # เราจะสร้าง dummy บางตัวโดย copy sequence แรกๆ ของ X_tmp
-        # แล้วตั้ง label เป็น [0,1,0] (Short=0, Hold=1, Long=0)
-        n_dummy = max(100, int(0.02 * len(X_tmp)))  
-        # (อย่างน้อย 5 ชิ้น หรือ 1% ของข้อมูลทั้งหมด)  
-        dummy_seq = np.repeat(X_tmp[:1], n_dummy, axis=0)
-        dummy_lbl = np.tile([0,1,0], (n_dummy, 1))
-        X_tmp = np.concatenate([X_tmp, dummy_seq], axis=0)
-        y_tmp = np.concatenate([y_tmp, dummy_lbl], axis=0)
-
-        labels_tmp = np.argmax(y_tmp, axis=1)
-        hold_count = np.sum(labels_tmp == 1)
-        print(f"Injected {n_dummy} dummy Hold → new Hold frac = {hold_count/len(labels_tmp):.2%}")
-        print("After injecting dummy, support:", np.unique(labels_tmp, return_counts=True))
-
-    # ——————————————————————————————————————————
-    # 2) แบ่ง train/val
+    # 4) split (ห้าม dummy/oversample)
     X_tr, X_va, y_tr, y_va = train_test_split(
-        X_tmp, y_tmp,
-        test_size=0.2,
-        shuffle=False,
-        random_state=42
+        X_tmp, y_tmp, test_size=0.2, shuffle=False, random_state=42
     )
-    y_true = np.argmax(y_va, axis=1)
-    labels_tr_before = np.argmax(y_tr, axis=1)
-    if np.sum(labels_tr_before == 1) == 0:
-        len_orig = len(labels_tmp) - n_dummy  # จำนวนก่อน inject
-        dummy_indices = list(range(len_orig, len_orig + n_dummy))
-        # ย้าย 1 dummy ทุกสิบตัว หรือจนกว่า X_tr จะมี Hold อย่างน้อย 1 ตัว
-        moved = 0
-        for idx in dummy_indices:
-            # หา position ของ idx ใน X_tmp ที่ map ไป X_tr / X_va
-            # อาศัย fact ว่าการ train_test_split เมื่อ shuffle=False จะเลือกแถวท้าย 20% เป็น val
-            if idx < len(X_tmp) * 0.8:
-                # idx อยู่ในส่วน train (80%)
-                moved += 1
-                break  # เจอ dummy ที่อยู่ใน train แล้ว
-        # ถ้ายังไม่เจอ dummy ใน train ให้คัดลอก dummy_seq เพิ่มเข้า X_tr โดยตรง
-        if moved == 0:
-            extra_seq = dummy_seq[:1]
-            extra_lbl = dummy_lbl[:1]
-            X_tr = np.concatenate([X_tr, extra_seq], axis=0)
-            y_tr = np.concatenate([y_tr, extra_lbl], axis=0)
-            moved = 1
 
-        print(f"Moved {moved} dummy Hold เข้า X_tr → Now train support:", 
-              np.unique(np.argmax(y_tr, axis=1), return_counts=True))
+    print("[SPLIT] train:", np.unique(np.argmax(y_tr,axis=1), return_counts=True),
+          "val:", np.unique(np.argmax(y_va,axis=1), return_counts=True))
+
+    with open("models/ea22/labeling.json", "w") as f:
+        json.dump({
+            "look_back": params["look_back"],
+            "hold_bars": params["max_hold_period"],
+            "thr_short": float(best_thr),
+            "thr_long":  float(best_thr)}, f)
+
+    # ===== Sanity A: หลัง split =====
+    def _to_lbl(y):
+        y = np.asarray(y)
+        return (np.argmax(y, 1) if y.ndim == 2 and y.shape[1] > 1 else y.reshape(-1)).astype(int)
+
+    def _nan_inf_info(name, arr):
+        a = np.asarray(arr)
+        n = a.size
+        nan = np.isnan(a).sum()
+        inf = np.isinf(a).sum()
+        print(f"  {name}: shape={a.shape}, NaN={nan} ({nan/n:.4%}), Inf={inf} ({inf/n:.4%})")
+
+    look_back = CONFIG["parameters"]["look_back"]
+    hold_bars = CONFIG["parameters"]["max_hold_period"]
+
+    print("\n[SANITY A] Split/shape/NaN check")
+    print(f"  look_back={look_back}, hold_bars={hold_bars}")
+    print(f"  X_tr shape={X_tr.shape}, X_va shape={X_va.shape}")
+    assert X_tr.ndim == 3 and X_tr.shape[1] == look_back, "X_tr shape ผิด (ต้องเป็น (n, look_back, n_features))"
+    assert X_va.ndim == 3 and X_va.shape[1] == look_back, "X_va shape ผิด"
+
+    _nan_inf_info("X_tr", X_tr)
+    _nan_inf_info("X_va", X_va)
+
+    y_tr_lbl = _to_lbl(y_tr)
+    y_va_lbl = _to_lbl(y_va)
+
+    def _dist(lbl, name):
+        u, c = np.unique(lbl, return_counts=True)
+        pct = {int(k): f"{v/len(lbl):.2%}" for k, v in zip(u, c)}
+        print(f"  {name} class dist: {dict(zip(u, c))}  pct={pct}")
+
+    _dist(y_tr_lbl, "train")
+    _dist(y_va_lbl, "val")
+
+    # ถือว่าไม่มี shuffle ต้องเรียงตามเวลา
+    assert not np.any(np.isnan(X_tr)), "X_tr ยังมี NaN"
+    assert not np.any(np.isnan(X_va)), "X_va ยังมี NaN"
         
     look_back = params["look_back"]
     n_features = X_tr.shape[2]
@@ -1825,30 +2053,25 @@ def run_ea22():
         return model
 
     # ——————————————————————————————————————————
-    # 4) Oversample เฉพาะใน X_tr
-    labels_tr_after = np.argmax(y_tr, axis=1)
-    if 1 in labels_tr_after:
-        X_tr, y_tr = oversample_hold_only(X_tr, y_tr, hold_class=1, target_frac=0.20)
-        labels_tr = np.argmax(y_tr, axis=1)
-        print("After oversample classes on train:", np.unique(labels_tr, return_counts=True))
-    else:
-        print("ยังไม่มี Hold ใน train แม้หลัง inject dummy → skip oversample_hold_only")
+    # [No-oversample] รายงาน distribution เฉยๆ แล้วไปใช้ class weights
+    labels_tr = np.argmax(y_tr, axis=1)
+    hold_frac_tr = (labels_tr == 1).mean()
+    print(f"[SANITY train] Hold frac = {hold_frac_tr:.2%} (counts={dict(zip(*np.unique(labels_tr, return_counts=True)))})")
+    print("[Resample] Disabled (Option A). Will use class weights only.")
 
-    tcn_params = tune_tcn(X_tr, y_tr, params["look_back"])
-    tft_params = tune_tft(X_tr, y_tr, params["look_back"])
+    y_tr_lbl = np.argmax(y_tr, axis=1)
+    tcn_params = tune_tcn(X_tr, y_tr_lbl, params["look_back"])
+    tft_params = tune_tft(X_tr, y_tr_lbl, params["look_back"])
 
     # 10) สร้างฟังก์ชัน build_base_fns (นำค่าที่ tune ได้มาใช้)
-    base_fns = [
-        build_model_lstm_att_hp,
-        build_tuned_lstm,
-        build_model_cnn_lstm,
+    base_fns = [build_model_lstm_att_hp,build_tuned_lstm,build_model_cnn_lstm,
         lambda lb, nf, fp=tcn_params['filters'], kp=tcn_params['kernel']: 
             build_model_tcn(lb, nf, filters=int(fp), kernel_size=int(kp)),
         lambda lb, nf, hp=tft_params['head_size'], fd=tft_params['ff_dim']: 
             build_model_transformer(lb, nf, head_size=int(hp), ff_dim=int(fd))
     ]
 
-    cv_scores = cross_validate_ea22(
+    accs, f1h, f1m = cross_validate_ea22(
         X_tr, y_tr,
         build_base_fns=base_fns,
         build_rf_fn=build_rf_model,
@@ -1856,35 +2079,61 @@ def run_ea22():
         look_back=params["look_back"],
         batch_size=params["batch_size"],
         epochs=params["epochs_ea22"],
-        n_splits=5
+        n_splits=4,                                     # 4–5 ได้ เลือกตามความยาวข้อมูล
+        inner_splits=3,                                 # OOF ด้านใน
+        embargo=params["look_back"] + params["max_hold_period"],
+        long_boost=1.0,                                 # จะ boost long ค่อยปรับ >1
+        hold_band=0.15                                  # coverage band ±15% รอบสัดส่วน Hold จริง
     )
-    print(f"[EA22 CV] Mean accuracy: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
 
-    # หลัง oversample_hold_only บน X_tr, y_tr
+    print(f"[EA22 CV] acc     : {np.mean(accs):.4f} ± {np.std(accs):.4f}")
+    print(f"[EA22 CV] F1-Hold : {np.mean(f1h):.4f} ± {np.std(f1h):.4f}")
+    print(f"[EA22 CV] F1-macro: {np.mean(f1m):.4f} ± {np.std(f1m):.4f}")
+
+    # [No-oversample] ใช้ class weights จาก y_tr ปัจจุบัน
     labels_res = np.argmax(y_tr, axis=1)
+
     present = np.unique(labels_res)
-    cw_vals = compute_class_weight(class_weight='balanced', classes=present, y=labels_res)
-    class_weights_dict = {c: w for c,w in zip(present, cw_vals)}
-    class_weights_dict[1] *= 1.0   # ขยับ Hold ขึ้นอีก 50%
-    weight_vector = np.array([class_weights_dict[i] for i in [0,1,2]], dtype=np.float32)
+    cw_vals = compute_class_weight(
+        class_weight='balanced',
+        classes=present,
+        y=labels_res
+    )
+    class_weights_dict = {int(c): float(w) for c, w in zip(present, cw_vals)}
+    # ถ้าบางคลาสไม่มีใน train ให้ default=1.0
+    for c in [0, 1, 2]:
+        class_weights_dict.setdefault(c, 1.0)
+
+    # เรียงตาม [0,1,2]
+    weight_vector = np.array([class_weights_dict[i] for i in [0, 1, 2]], dtype=np.float32)
+
+    # loss แบบถ่วงน้ำหนัก (กัน dtype mismatch)
+    def weighted_cce_loss(weight_vector):
+        weights = tf.constant(weight_vector, dtype=tf.float32)
+        def loss(y_true, y_pred):
+            y_true = tf.cast(y_true, tf.float32)
+            y_pred = tf.cast(y_pred, tf.float32)
+            cce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+            sample_weights = tf.reduce_sum(y_true * weights, axis=1)
+            return cce * sample_weights
+        return loss
+
     loss_fn = weighted_cce_loss(weight_vector)
+
+    # (สำคัญ) ให้ label เป็น float32 เสมอ
+    y_tr = y_tr.astype(np.float32)
+    y_va = y_va.astype(np.float32)
+
+    print("[ClassWeight] ", class_weights_dict)
 
     # 14) สร้าง deep_models 4 แบบ แล้ว compile ด้วย loss_fn + metrics per-class
     deep_models = []
-    for build_fn in [
-        build_model_lstm_att_hp,
-        build_tuned_lstm,
-        build_model_cnn_lstm,
-        lambda lb, nf: build_model_tcn(lb, nf, filters=int(tcn_params['filters']), kernel_size=int(tcn_params['kernel'])),
-        lambda lb, nf: build_model_transformer(lb, nf, head_size=int(tft_params['head_size']), ff_dim=int(tft_params['ff_dim']))
-    ]:
+    for build_fn in [build_model_lstm_att_hp,build_tuned_lstm,build_model_cnn_lstm,lambda lb, nf: build_model_tcn(lb, nf, filters=int(tcn_params['filters']), kernel_size=int(tcn_params['kernel'])),lambda lb, nf: build_model_transformer(lb, nf, head_size=int(tft_params['head_size']), ff_dim=int(tft_params['ff_dim']))]:
         m = build_fn(params["look_back"], X_tr.shape[2])
-        m.compile(
-            optimizer=LossScaleOptimizer(Adam(learning_rate=1e-4)),
-            loss=loss_fn,
+        m.compile(optimizer=LossScaleOptimizer(Adam(learning_rate=1e-4)),loss=loss_fn,
             metrics=[
                 'accuracy',
-                MacroF1(num_classes=3),
+                MacroF1(num_classes=3, dtype=tf.float32),
                 tf.keras.metrics.Precision(class_id=1, name='prec_hold'),
                 tf.keras.metrics.Recall(class_id=1, name='rec_hold')
             ]
@@ -1904,6 +2153,17 @@ def run_ea22():
     y_lbl_va = np.argmax(y_va, axis=1)
     y1_tr = (y_lbl_tr == 2).astype(int)
     y1_va = (y_lbl_va == 2).astype(int)
+
+    for i, m in enumerate(deep_models):
+        print(f"[EA22] Train base model #{i+1}/{len(deep_models)}")
+        m.fit(
+            X_tr, y_tr,
+            validation_data=(X_va, y_va),
+            epochs=params["epochs_ea22"],
+            batch_size=params["batch_size"],
+            callbacks=[earlystop, reduce_lr],
+            verbose=1
+        )
     
     present1 = np.unique(y1_tr)  # ดูว่ามีคลาส [0] หรือ [1] หรือ [0,1]
     if len(present1) < 2:
@@ -1933,9 +2193,12 @@ def run_ea22():
         epochs=params["epochs_ea22"],
         batch_size=params["batch_size"],
         class_weight=class_weight_stage1,
-        callbacks=[tb_cb, earlystop, reduce_lr, ConfusionMatrixCallback(validation_data=(X_va, y1_va))],
+        callbacks=[tb_cb, earlystop, reduce_lr,ConfusionMatrixCallback(validation_data=(X_va, y1_va),labels=[0,1],target_names=['Rest','Long'])],
         verbose=1
     )
+
+    m1.save("models/ea22/m1_long_vs_rest.h5")
+    m1.save("models/ea22/stage1_long_rest.h5")
 
     # 2) เตรียมข้อมูลสำหรับ Stage 2: Short vs Hold บน “Rest”
     #    ก่อนอื่นหา indices ที่ Stage1 ทายเป็น Rest (==0)
@@ -1965,7 +2228,7 @@ def run_ea22():
             y2_tr
         )
         
-        X_tr2 = X2_flat.reshape(-1, LOOK_BACK, X_tr.shape[2])
+        X_tr2 = X2_flat.reshape(-1, params["look_back"], X_tr.shape[2])
         y2_tr = y2_res
         print("ใช้ BorderlineSMOTE Stage 2 → support Short vs Hold:", np.unique(y2_tr, return_counts=True))
     
@@ -1983,8 +2246,7 @@ def run_ea22():
         )
         class_weight_stage2 = {
             0: float(cw2_vals[0]),
-            1: float(cw2_vals[1]) * 1.3
-        }
+            1: float(cw2_vals[1]) * 1.3}
 
     # สร้างและฝึก Stage-2 Model
     m2 = build_stage2_model(input_shape=(params["look_back"], X_tr.shape[2]))
@@ -2003,187 +2265,268 @@ def run_ea22():
         verbose=1
     )
 
-    # 19) Train RF + Stacking Meta-Model
-    rf22 = build_rf_model()
-    rf22.fit(X_tr.reshape(len(X_tr), -1), y_lbl_tr)
+    m2.save("models/ea22/stage2_short_hold.h5")
 
-    meta_X22 = get_base_predictions(deep_models, X_tr, rf_model=rf22)
-    meta22 = build_meta_model(input_dim=meta_X22.shape[1])
+    build_base_fns = [
+        lambda lb, nf: build_model_lstm_att_hp(lb, nf),
+        lambda lb, nf: build_tuned_lstm(lb, nf),
+        lambda lb, nf: build_model_cnn_lstm(lb, nf),
+        lambda lb, nf: build_model_tcn(lb, nf,
+                                       filters=int(tcn_params['filters']),
+                                       kernel_size=int(tcn_params['kernel'])),
+        lambda lb, nf: build_model_transformer(lb, nf,
+                                               head_size=int(tft_params['head_size']),
+                                               ff_dim=int(tft_params['ff_dim']))
+    ]
 
-    # แบ่ง train/val สำหรับ meta-model
-    X_meta_tr, X_meta_val, y_meta_tr, y_meta_val = train_test_split(
-        meta_X22,
-        y_lbl_tr,         # label เดิม 0/1/2
-        test_size=0.2,
-        random_state=42,
-        shuffle=False
+    # ❶ ทำ OOF meta-features บน train (กัน leakage)
+    meta_X_tr, y_meta_tr, base_full, rf22 = make_oof_meta_features(
+        X_tr, y_tr,
+        build_base_fns=build_base_fns,
+        rf_builder=build_rf_model,
+        look_back=params["look_back"],
+        batch_size=params["batch_size"],
+        epochs=params["epochs_ea22"],
+        n_splits=4,
+        embargo=params["look_back"] + params["max_hold_period"]
     )
 
-    # 6) คำนวณ class_weight สำหรับ Meta-Model
-    labels_meta = np.unique(y_meta_tr)  # ค่าที่มีจริงใน sub-train (0/1/2 บางทีอาจครบทุกคลาส)
-    cw_meta_vals = compute_class_weight(
-        class_weight='balanced',
-        classes=labels_meta,
-        y=y_meta_tr
+    # ❷ meta บน holdout/val ใช้ base_full ที่ฝึกบน train ทั้งก้อน
+    meta_X_va = get_base_predictions(
+        base_full, X_va,
+        rf_model=rf22,
+        batch_size=params["batch_size"]
     )
-    class_weight_meta = {int(c): float(w) for c, w in zip(labels_meta, cw_meta_vals)}
-    # เติม default=1.0 ให้ครบ 0,1,2
-    for c in [0, 1, 2]:
+
+    # ===== Sanity B: OOF/meta =====
+    print("\n[SANITY B] OOF/meta features")
+    print(f"  meta_X_tr shape={meta_X_tr.shape}, meta_X_va shape={meta_X_va.shape}")
+
+    mask_oof = ~np.any(np.isnan(meta_X_tr), axis=1)
+    print(f"  OOF valid rows = {mask_oof.sum()}/{len(mask_oof)} ({mask_oof.mean():.2%})")
+    if mask_oof.mean() < 0.75:
+        print("  ⚠️ OOF coverage ต่ำ — ลองลด embargo หรือเพิ่มสัดส่วน train")
+
+    # ดู performance ของ base models ทีละตัวบน val (ยังไม่รวม meta)
+    print("  [Base models on VAL]")
+
+    # ❸ เตรียม label แบบ 1D
+    y_lbl_va = _to_lbl(y_va)
+
+    for i, bm in enumerate(base_full, 1):
+        p = bm.predict(X_va, verbose=0)
+        pred = np.argmax(p, axis=1)
+        acc = (pred == y_lbl_va).mean()
+        hold_frac = (pred == 1).mean()
+        print(f"    Base#{i}: acc={acc:.3f}, pred_hold={hold_frac:.2%}")
+
+    meta_X_tr_fit = meta_X_tr[mask_oof]
+    y_meta_tr_fit = y_meta_tr[mask_oof]
+
+    # ❹ ฝึก meta22 บน OOF
+    meta22 = build_meta_model(input_dim=meta_X_tr_fit.shape[1])
+
+    labels_meta  = np.unique(y_meta_tr_fit)
+    cw_meta_vals = compute_class_weight('balanced', classes=labels_meta, y=y_meta_tr_fit)
+    class_weight_meta = {int(c): float(w) for c,w in zip(labels_meta, cw_meta_vals)}
+    for c in [0,1,2]:
         class_weight_meta.setdefault(c, 1.0)
-
-    # —— ข้อ 4: เพิ่มน้ำหนักให้คลาส “Long” (2) —— 
-    long_boost = 1.5  # จะปรับเป็น 1.2, 2.0, ฯลฯ ตามต้องการ
-    class_weight_meta[2] = class_weight_meta[2] * long_boost
-    print("Adjusted class weights:", class_weight_meta)
-
-    # 7) Compile Meta-Model
-    meta22.compile(
-        optimizer=Adam(learning_rate=1e-4),
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-
-    # 8) ฝึก Meta-Model พร้อม class_weight และ EarlyStopping
+    # ลองไม่ boost long ก่อน
+    print("Adjusted class weights (no long boost):", class_weight_meta)
+ 
+    meta22.compile(optimizer=Adam(1e-4),loss='sparse_categorical_crossentropy',metrics=['accuracy'])
     meta22.fit(
-        X_meta_tr, y_meta_tr,
-        validation_data=(X_meta_val, y_meta_val),
+        meta_X_tr_fit, y_meta_tr_fit,
+        validation_data=(meta_X_va, y_lbl_va),
         epochs=params["epochs_ea22"],
         batch_size=params["batch_size"],
         class_weight=class_weight_meta,
-        callbacks=[earlystop, reduce_lr, ConfusionMatrixCallback(validation_data=(X_meta_val, y_meta_val))],
-        verbose=1)
+        callbacks=[earlystop, reduce_lr,
+                   ConfusionMatrixCallback(validation_data=(meta_X_va, y_lbl_va))],
+        verbose=1
+    )
 
-     # ---- Calibration with IsotonicRegression ----
-    # (a) ดึง P(Hold) บน meta‐train
-    probs_tr = meta22.predict(X_meta_tr)    # shape=(n_tr,3)
-    P_hold_tr = probs_tr[:,1]
-    y_hold_tr = (y_meta_tr == 1).astype(int)
-    # เตรียม true label สำหรับ Hold
-    mask = ~np.isnan(P_hold_tr)
-    
-    uniq = np.unique(y_hold_tr[mask])
-    if len(uniq) == 2:
-        iso = IsotonicRegression(out_of_bounds='clip')
-        iso.fit(P_hold_tr[mask], y_hold_tr[mask])
-        def calibrate(p): 
-            return iso.predict(np.nan_to_num(p, nan=0.5))
-    else:
-    # ถ้า meta-train ไม่มีทั้ง 0 และ 1 สำหรับคลาส Hold ให้ข้าม calibration
-        def calibrate(p): 
-            return np.nan_to_num(p, nan=0.5)
+    # ❺ Calibration/threshold (ใช้เฉพาะตำแหน่งที่ OOF valid)
+    probs_tr  = meta22.predict(meta_X_tr_fit, verbose=0)   # OOF train probs
+    P_hold_tr  = probs_tr[:, 1]
+    y_hold_tr = (y_meta_tr_fit == 1).astype(int)
 
-    # (b) คำนวณ P(Hold) บน meta‐val แล้ว calibrate
-    probs_val_meta   = meta22.predict(X_meta_val)  # อันนี้ยัง raw
-    P_hold_cal_val = calibrate(probs_val_meta[:, 1])
-    y_true_hold_val = (y_meta_val == 1).astype(int)
+    mask_nan = ~np.isnan(P_hold_tr)
+    P_fit = np.asarray(P_hold_tr[mask_nan], dtype=np.float64).reshape(-1, 1)
+    y_fit = np.asarray(y_hold_tr[mask_nan], dtype=np.int32)
 
-    # ---- 1) รันด้วย Fixed Threshold = 0.48 ----
-    hold_thr_fixed = 0.48
+    # 2) ต้องมีทั้ง 0/1 และมีอย่างน้อย N ตัวอย่างต่อคลาส
+    min_per_class = 10
+    use_platt = False
+    cal_lr = None
+    if (np.unique(y_fit).size == 2 and
+        (y_fit == 0).sum() >= min_per_class and
+        (y_fit == 1).sum() >= min_per_class):
+        cal_lr = LogisticRegression(
+            solver='lbfgs', class_weight='balanced', max_iter=500, n_jobs=None
+        )
+        cal_lr.fit(P_fit, y_fit)
+        use_platt = True
 
-    # กัน NaN ก่อนเลือก Short(0)/Long(2)
+    def calibrate(p):
+        p = np.nan_to_num(np.asarray(p, dtype=np.float64), nan=0.5).reshape(-1, 1)
+        if use_platt and (cal_lr is not None):
+            return np.clip(cal_lr.predict_proba(p)[:, 1], 0.0, 1.0)
+        return np.clip(p.ravel(), 0.0, 1.0)
+
+    # ตัดสิน Hold ด้วย threshold; ที่ไม่ Hold เลือก 0/2 ตาม p0 vs p2
+    probs_val_meta = meta22.predict(meta_X_va, verbose=0)
     p0 = np.nan_to_num(probs_val_meta[:, 0], nan=0.0)
+    p1 = np.nan_to_num(probs_val_meta[:, 1], nan=0.5)
     p2 = np.nan_to_num(probs_val_meta[:, 2], nan=0.0)
-    other_pred_val = np.where(p0 >= p2, 0, 2)
+    P_hold_cal_val = calibrate(p1)
+    other_pred_val = np.where((p2 >= p0) & (P_long > long_thr), 2, 0)
 
-    final_pred_fixed = np.where(
-        P_hold_cal_val > hold_thr_fixed,
-        1,                          # Hold
-        other_pred_val)
-
-    y_meta_val_labels = y_meta_val if y_meta_val.ndim == 1 else np.argmax(y_meta_val, axis=1)
+    # (ออปชัน) ทดสอบ threshold คงที่
+    hold_thr_fixed = 0.48
+    final_pred_fixed = np.where(P_hold_cal_val > hold_thr_fixed, 1, other_pred_val)
     print(f"\n=== Fixed hold_thr = {hold_thr_fixed:.2f} ===")
-    print(classification_report(
-        y_meta_val_labels,
-        final_pred_fixed,
-        target_names=['Short','Hold','Long'],
-        zero_division=0
-    ))
-    print("Confusion Matrix:\n",  confusion_matrix(y_meta_val_labels, final_pred_fixed, labels=[0,1,2])
-    )
+    print(classification_report(y_lbl_va, final_pred_fixed,
+                                target_names=['Short','Hold','Long'],
+                                labels=[0,1,2], zero_division=0))
+    print("Confusion Matrix:\n", confusion_matrix(y_lbl_va, final_pred_fixed, labels=[0,1,2]))
 
-    # ---- หา optimal threshold ด้วย F1‐macro ----
-    best_thr, best_f1 = 0.5, 0.0
-    for thr in np.linspace(0.30, 0.60, num=301):
-        pred_is_hold = (P_hold_cal_val > thr).astype(int)
-        if y_true_hold_val.sum() == 0:
-            f1 = 0.0
-        else:
-            f1 = f1_score(y_true_hold_val, pred_is_hold, average='binary', pos_label=1, zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_thr = f1, thr
+    # ---- pick hold_thr to match target (with band) ----
+    P = np.asarray(P_hold_cal_val, dtype=np.float64)
+    P = np.nan_to_num(P, nan=0.5)
 
-    hold_thr = best_thr 
-    print(f"Optimal hold_thr (binary-F1 for Hold): {best_thr:.3f}, F1 = {best_f1:.4f}")
+    y_hold_true = (y_lbl_va == 1).astype(int)
+    target_hold = y_hold_true.mean()                  # สัดส่วน Hold จริงบน val
 
-    # — Stage 1 & 2 evaluate with confidence threshold —
-    # 1) พยากรณ์ Stage1 (Long vs Rest)
-    probs1     = m1.predict(X_va)          # shape=(n_val,2)
-    long_probs = probs1[:, 1]              # P(Long)
-    long_thr   = 0.6                       # ปรับตามผล CV
-    long_mask  = long_probs > long_thr     # Boolean array ยาว n_val
+    # กำหนดช่วง coverage ที่ยอมรับได้รอบ target (เช่น ±15%)
+    band = 0.15
+    min_hold_frac = max(0.10, target_hold * (1 - band))
+    max_hold_frac = min(0.60, target_hold * (1 + band))   # กันล้น ไม่เกิน 60%
 
-    meta_X_va   = get_base_predictions(deep_models, X_va, rf_model=rf22, batch_size=params["batch_size"])
-    prob_va    = meta22.predict(meta_X_va)
-    P_hold_cal_va  = calibrate(prob_va[:, 1]) 
+    # ค่าเริ่มต้นด้วย quantile: อยากได้ frac ≈ target -> thr = quantile(1 - target)
+    thr_q = float(np.quantile(P, max(0.0, min(1.0, 1.0 - target_hold))))
 
-    final_pred = np.zeros(len(X_va), dtype=int)
-    final_pred[long_mask] = 2
-    hold_mask = (~long_mask) & (P_hold_cal_va > hold_thr)
-    final_pred[hold_mask] = 1 
-                                 
-    # 6) ประเมินผล
-    y_true = np.argmax(y_va, axis=1)
-    print(classification_report(y_true, final_pred, target_names=['Short','Hold','Long']))
-    print("Confusion Matrix:\n", confusion_matrix(y_true, final_pred, labels=[0,1,2]))
+    # ไล่หาค่าที่ดีกว่าในกรอบรอบๆ thr_q
+    grid = np.linspace(max(0.05, thr_q - 0.15), min(0.95, thr_q + 0.15), 201)
 
-    # คำนวณ calibration curve
-    fraction_of_pos, mean_pred_value = calibration_curve(
-        y_true_hold_val,
-        P_hold_cal_val,          
-        n_bins=10,
-        strategy='uniform'
-    )
+    best_score, best_thr = -1.0, thr_q
+    best_frac, best_f1 = (P > best_thr).mean(), f1_score(y_hold_true, (P > best_thr).astype(int), zero_division=0)
 
-    # วาดกราฟ
-    plt.figure(figsize=(6,6))
-    plt.plot(mean_pred_value, fraction_of_pos, "s-", label="Calibrated")
-    plt.plot([0,1], [0,1], "k--", label="Perfectly calibrated")
-    plt.xlabel("Mean predicted probability")
-    plt.ylabel("Fraction of positives")
-    plt.title("Reliability Diagram — Hold Class")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-    plt.hist(P_hold_cal, bins=10, range=(0,1), alpha=0.3, label="Prob histogram")
-    plt.legend()
-    plt.show()
+    for thr in grid:
+        pred_is_hold = (P > thr).astype(int)
+        frac = pred_is_hold.mean()
+        # ต้องอยู่ใน band ที่ยอมรับได้
+        if not (min_hold_frac <= frac <= max_hold_frac):
+            continue
+        f1 = f1_score(y_hold_true, pred_is_hold, zero_division=0)
+        score = f1 - 0.20 * abs(frac - target_hold)   # ลงโทษการเบี่ยงฐาน
+        if score > best_score:
+            best_score, best_thr, best_frac, best_f1 = score, float(thr), float(frac), float(f1)
 
-    # ---- สรุปผลที่ threshold ใหม่ ----
-    final_pred = np.where(P_hold_cal > best_thr,
-                          1,
-                          np.argmax(probs_val, axis=1))
-    print(classification_report(y_meta_val, final_pred, target_names=['Short','Hold','Long']))
-    print("Confusion Matrix:\n", confusion_matrix(y_meta_val, final_pred))
+    # ถ้าไม่มีค่าบน grid ผ่าน band เลย → fallback ใช้ thr_q (ใกล้ target สุด)
+    hold_thr = float(best_thr)
+    print(f"Picked hold_thr = {hold_thr:.3f} "
+          f"(target={target_hold:.2%}, frac={best_frac:.2%}, F1={best_f1:.4f}, "
+          f"band=[{min_hold_frac:.2%},{max_hold_frac:.2%}], start={thr_q:.3f})")
+
+    # จูนด้วย F1(Long vs Rest) เฉพาะเมื่อมีทั้งบวก/ลบเพียงพอ
+    def pick_long_threshold(P, y, p_min=0.70, beta=0.3, grid=None):
+        if grid is None:
+            grid = np.linspace(0.55, 0.90, 71)
+        best = (-1.0, 0.60)
+        for thr in grid:
+            pred = (P > thr).astype(int)
+            if precision_score(y, pred, zero_division=0) < p_min:
+                continue
+            f = fbeta_score(y, pred, beta=beta, zero_division=0)
+            if f > best[0]:
+                best = (f, float(thr))
+        return best[1]
+
+    # ---- กำหนด/จูน long_thr *ก่อน* เซฟไฟล์ ----
+    probs1 = m1.predict(X_va, batch_size=params["batch_size"], verbose=0)  # shape=(n_val, 2)
+    P_long = probs1[:, 1]
+    y_true_long = (y_lbl_va == 2).astype(int)
+    long_thr = pick_long_threshold(P_long, (y_lbl_va==2).astype(int),
+                               p_min=0.55, beta=0.5, min_trades=30)
+    print(f"Picked long_thr = {long_thr:.2f}") 
+
+    # ===== Sanity C: Thresholds/gates =====
+    print("\n[SANITY C] Thresholds & gates")
+    print(f"  hold_thr = {hold_thr:.3f}, long_thr = {long_thr:.3f}")
+
+    # สถิติความถี่หลัง calibrate
+    print(f"[P(Hold) stats] min={P_hold_cal_val.min():.3f}, p25={np.percentile(P_hold_cal_val,25):.3f}, "
+          f"p50={np.median(P_hold_cal_val):.3f}, p75={np.percentile(P_hold_cal_val,75):.3f}, max={P_hold_cal_val.max():.3f}")
+
+    # อัตราการทริกเกอร์แต่ละ gate (ก่อนบังคับ Long)
+    hold_flag = (P_hold_cal_val > hold_thr)
+    print(f"  Hold flag (by hold_thr): {hold_flag.mean():.2%}")
+    print(f"  Long flag (by long_thr): {(P_long > long_thr).mean():.2%}")
+
+    # เซฟ calibrator/threshold
+    os.makedirs("models/ea22", exist_ok=True)
+    if use_platt and (cal_lr is not None):
+        joblib.dump(cal_lr, "models/ea22/cal_hold_platt.pkl")
+    with open("models/ea22/thresholds.json", "w") as f:
+        json.dump({"hold_thr": float(hold_thr),
+                   "long_thr": float(long_thr),
+                   "calibrator": "platt" if use_platt else "identity"}, f)
+
+    # --- เตรียมสำหรับ gate ---
+    long_mask  = (P_long > long_thr)
+    base_pred  = np.where(P_hold_cal_val > hold_thr, 1, other_pred_val).astype(int)
+    probs_gate = np.stack([p0, P_hold_cal_val, p2], axis=1)
+
+    # เลือกเกณฑ์ให้ coverage อยู่ในช่วง 15–30%
+    CONF_MIN, MARGIN_MIN, eval_mask = pick_gate(probs_gate, long_mask, target_range=(0.15, 0.30))
+
+    # สร้าง final_pred ตามเกณฑ์ที่เลือก
+    final_pred = base_pred.copy()
+    rest_mask  = ~long_mask
+    if rest_mask.any():
+        p_rest  = probs_gate[rest_mask]
+        top     = p_rest.max(axis=1)
+        second  = np.partition(p_rest, -2, axis=1)[:, -2]
+        trade_rest = (top >= CONF_MIN) & ((top - second) >= MARGIN_MIN)
+        final_pred[rest_mask] = np.where(trade_rest, final_pred[rest_mask], 1).astype(int)
+
+    nonlong_cov = ((eval_mask & ~long_mask).mean() if eval_mask.any() else 0.0)
+    print(f"[Gate] CONF_MIN={CONF_MIN:.3f}, MARGIN_MIN={MARGIN_MIN:.3f}, "
+          f"coverage={eval_mask.mean():.2%} (long {long_mask.mean():.2%}, non-long {nonlong_cov:.2%})")
+
+    # รายงานผลเฉพาะที่ “ยอมเทรด”
+    if eval_mask.any():
+        print(classification_report(
+            y_lbl_va[eval_mask], final_pred[eval_mask],
+            target_names=['Short','Hold','Long'], labels=[0,1,2], zero_division=0))
+        print("Confusion Matrix (on-trade only):\n",
+              confusion_matrix(y_lbl_va[eval_mask], final_pred[eval_mask], labels=[0,1,2]))
+    else:
+        print("⚠️ ไม่มีบาร์ผ่านเกณฑ์ — ผ่อน target_range หรือปรับกริดค้นหา")
+
+    # — Calibration plots (ทั้งชุด val ไม่ต้องใช้ mask)
+    y_true_hold_val = (y_lbl_va == 1).astype(int)
+    assert len(y_true_hold_val) == len(P_hold_cal_val)
+    frac_pos, mean_pred = calibration_curve(y_true_hold_val, P_hold_cal_val, n_bins=10, strategy='quantile')
+    plt.figure(figsize=(5,5))
+    plt.plot(mean_pred, frac_pos, "s-", label="Calibrated")
+    plt.plot([0,1], [0,1], "k--", label="Perfect")
+    plt.xlabel("Mean predicted probability"); plt.ylabel("Fraction of positives")
+    plt.title("Reliability — Hold"); plt.grid(True); plt.legend(); plt.show()
+
+    plt.figure(figsize=(5,3))
+    plt.hist(P_hold_cal_val, bins=10, range=(0,1), alpha=0.3)
+    plt.title("Distribution of calibrated P(Hold)")
+    plt.xlabel("P(Hold)"); plt.ylabel("Count"); plt.grid(True); plt.show()
 
     # 20) Save artifacts
-    artifacts = {
-        "ea22_lstm":       deep_models[0],
-        "ea22_cnn_lstm":   deep_models[1],
-        "ea22_tcn":        deep_models[2],
-        "ea22_transformer": deep_models[3],
-        "scaler22":        scaler,
-        "rf22":            rf22,
-        "meta22":          meta22
-    }
+    artifacts = {"ea22_lstm": deep_models[0], "ea22_tuned_lstm": deep_models[1], "ea22_cnn_lstm": deep_models[2], "ea22_tcn": deep_models[3], "ea22_transformer": deep_models[4], "scaler22": scaler, "rf22": rf22, "meta22": meta22}
     save_model_bundle(artifacts, folder="models/ea22")
     logger.info("✅ EA22 Single-TF Training Complete")
 
     # 21) Cleanup memory (ลบเฉพาะตัวแปรที่มีอยู่จริง)
-    to_delete = [
-        'df','X_raw','scaled','data_pca','X_tmp','y_tmp',
-        'X_tr','X_va','y_tr','y_va','deep_models',
-        'rf22','meta_X22','meta22'
-    ]
+    to_delete = ['df','X_raw','scaled','data_pca','X_tmp','y_tmp','X_tr','X_va','y_tr','y_va','deep_models','rf22','meta_X22','meta22']
     for name in to_delete:
         if name in locals():
             del locals()[name]
@@ -2205,20 +2548,13 @@ def run_ea27():
     df_m15 = prepare_base_dataframe(paths["M15"], symbol, dfs_other={})
     df_h1 = prepare_base_dataframe(paths["H1"], symbol, dfs_other={})
     # 2) Join multi-TF; ใช้ left join + ffill เพื่อไม่ลด row หลักลงเยอะ
-    df27 = (
-        df_m5
-        .join(df_m15.add_suffix("_M15"), how="left")
-        .fillna(method='ffill')
-        .join(df_h1.add_suffix("_H1"), how="left")
-        .fillna(method='ffill')
-    )
+    df27 = (df_m5.join(df_m15.add_suffix("_M15"), how="left").fillna(method='ffill').join(df_h1.add_suffix("_H1"), how="left").fillna(method='ffill'))
 
-    check_dataset_sufficiency(
-        df27,
-        look_back=params["look_back"],
-        hold_bars=params["max_hold_period"],
-        min_trades=params["min_trades"]
-    )
+    try:
+        check_dataset_sufficiency(df27,look_back=params["look_back"],hold_bars=params["max_hold_period"],min_trades=params["min_trades"])
+    except InsufficientDataError as e:
+        logger.error("EA27 aborted: %s", e)
+        return
 
     # 3) เตรียม features (ตัวเลขเท่านั้น) + orderbook
     features_ea27 = [c for c in df27.columns if df27[c].dtype != 'O']
@@ -2240,24 +2576,12 @@ def run_ea27():
     joblib.dump(pca_27, "models/ea27/pca27.pkl")
 
     # 4) หา threshold จาก price-driven label
-    thr_short27, thr_long27 = find_threshold_by_grid(
-        df27, data_pca_27,
-        look_back=params["look_back"],
-        hold_bars=params["max_hold_period"],
-        low=0.0001, high=0.005, step=0.00005,
-        target_hold_frac=(0.005, 0.05)
-    )
+    thr_short27, thr_long27 = find_threshold_by_grid(df27, data_pca_27,look_back=params["look_back"],hold_bars=params["max_hold_period"],low=0.0001, high=0.005, step=0.00005,target_hold_frac=(0.005, 0.05))
     with open("models/ea27/best_threshold.pkl", "wb") as f:
         pickle.dump((thr_short27, thr_long27), f)
 
     # 5) สร้าง dataset classification
-    X_tmp, y_tmp = create_labels_from_price(
-        df27,
-        look_back=params["look_back"],
-        hold_bars=params["max_hold_period"],
-        thr_short=thr_short27,
-        thr_long=thr_long27
-    )
+    X_tmp, y_tmp = create_labels_from_price(df27,look_back=params["look_back"],hold_bars=params["max_hold_period"],thr_short=thr_short27,thr_long=thr_long27)
     print("Before oversample, classes:", np.unique(np.argmax(y_tmp, axis=1)))
 
     # 6) inject dummy hold ถ้าไม่มี
@@ -2282,22 +2606,8 @@ def run_ea27():
     print("After oversample:", dict(zip(unique2, counts2)))
 
     # 8) CV ด้วย cross_validate_ea22
-    base_fns27 = [
-        build_model_lstm_att_hp,
-        build_model_cnn_lstm,
-        build_model_tcn,
-        build_model_transformer
-    ]
-    cv27_scores = cross_validate_ea22(
-        X_res, y_res,
-        build_base_fns=base_fns27,
-        build_rf_fn=build_rf_model,
-        build_meta_fn=build_meta_model,
-        look_back=params["look_back"],
-        batch_size=params["batch_size"],
-        epochs=params["epochs_ea27"],
-        n_splits=5
-    )
+    base_fns27 = [build_model_lstm_att_hp,build_model_cnn_lstm,build_model_tcn,build_model_transformer]
+    cv27_scores = cross_validate_ea22(X_res, y_res,build_base_fns=base_fns27,build_rf_fn=build_rf_model,build_meta_fn=build_meta_model,look_back=params["look_back"],batch_size=params["batch_size"],epochs=params["epochs_ea27"],n_splits=5)
     print(f"[EA27 CV] Mean accuracy: {np.mean(cv27_scores):.4f} ± {np.std(cv27_scores):.4f}")
 
     # 9) train/val split สุดท้าย
@@ -2317,18 +2627,9 @@ def run_ea27():
 
     # 12) สร้าง deep_models 4 แบบ แล้ว compile
     deep_models = []
-    for build_fn in [
-        build_model_lstm_att_hp,
-        build_model_cnn_lstm,
-        lambda lb, nf: build_model_tcn(lb, nf, filters=int(tcn_params['filters']), kernel_size=int(tcn_params['kernel'])),
-        lambda lb, nf: build_model_transformer(lb, nf, head_size=int(tft_params['head_size']), ff_dim=int(tft_params['ff_dim']))
-    ]:
+    for build_fn in [build_model_lstm_att_hp,build_model_cnn_lstm,lambda lb, nf: build_model_tcn(lb, nf, filters=int(tcn_params['filters']), kernel_size=int(tcn_params['kernel'])),lambda lb, nf: build_model_transformer(lb, nf, head_size=int(tft_params['head_size']), ff_dim=int(tft_params['ff_dim']))]:
         m = build_fn(params["look_back"], X_tr.shape[2])
-        m.compile(
-            optimizer=LossScaleOptimizer(Adam(learning_rate=1e-4)),
-            loss=loss_fn,
-            metrics=['accuracy']
-        )
+        m.compile(optimizer=LossScaleOptimizer(Adam(learning_rate=1e-4)),loss=loss_fn,metrics=['accuracy'])
         deep_models.append(m)
 
     tb27 = TensorBoard(log_dir="logs/ea27_per_class", update_freq='epoch')
@@ -2346,20 +2647,8 @@ def run_ea27():
         class_weight_stage1_27 = {int(c): float(w) for c, w in zip(present1_27, cw1_27)}
 
     m1_27 = build_stage1_model(input_shape=(params["look_back"], X_tr.shape[2]))
-    m1_27.compile(
-        optimizer=Adam(learning_rate=1e-4),
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    m1_27.fit(
-        X_tr, y1_tr27,
-        validation_data=(X_va, y1_va27),
-        epochs=params["epochs_ea27"],
-        batch_size=params["batch_size"],
-        class_weight=class_weight_stage1_27,
-        callbacks=[tb27, EarlyStopping(patience=5, restore_best_weights=True)],
-        verbose=1
-    )
+    m1_27.compile(optimizer=Adam(learning_rate=1e-4),loss='sparse_categorical_crossentropy',metrics=['accuracy'])
+    m1_27.fit(X_tr, y1_tr27,validation_data=(X_va, y1_va27),epochs=params["epochs_ea27"],batch_size=params["batch_size"],class_weight=class_weight_stage1_27,callbacks=[tb27, EarlyStopping(patience=5, restore_best_weights=True)],verbose=1)
 
     # 14) Stage 2: Short vs Hold ปรับใช้ label จริง (ไม่ใช้ prediction จาก Stage 1)
     mask_tr27 = (lbl_tr27 != 2)
@@ -2378,20 +2667,8 @@ def run_ea27():
             class_weight_stage2_27.setdefault(c, 1.0)
 
     m2_27 = build_stage2_model(input_shape=(params["look_back"], X_tr.shape[2]))
-    m2_27.compile(
-        optimizer=Adam(learning_rate=1e-4),
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    m2_27.fit(
-        X_tr2_27, y2_tr27,
-        validation_data=(X_va2_27, y2_va27),
-        epochs=params["epochs_ea27"],
-        batch_size=params["batch_size"],
-        class_weight=class_weight_stage2_27,
-        callbacks=[tb27, EarlyStopping(patience=5, restore_best_weights=True)],
-        verbose=1
-    )
+    m2_27.compile(optimizer=Adam(learning_rate=1e-4),loss='sparse_categorical_crossentropy',metrics=['accuracy'])
+    m2_27.fit(X_tr2_27, y2_tr27,validation_data=(X_va2_27, y2_va27),epochs=params["epochs_ea27"],batch_size=params["batch_size"],class_weight=class_weight_stage2_27,callbacks=[tb27, EarlyStopping(patience=5, restore_best_weights=True)],verbose=1)
 
     # 15) Evaluate Two-Stage
     p1_va27 = m1_27.predict(X_va).argmax(axis=1)
@@ -2414,22 +2691,13 @@ def run_ea27():
         X_tr = np.concatenate([X_tr, dummy_x], axis=0)
         lbl_tr27 = np.concatenate([lbl_tr27, dummy_y], axis=0)
 
-    xgb27 = xgb.XGBClassifier(
-        objective='multi:softprob',
-        num_class=3,
-        use_label_encoder=False,
-        eval_metric='mlogloss',
-        random_state=42
-    )
+    xgb27 = xgb.XGBClassifier(objective='multi:softprob',num_class=3,use_label_encoder=False,eval_metric='mlogloss',random_state=42)
     xgb27.fit(X_tr.reshape(len(X_tr), -1), lbl_tr27)
 
     meta_X_tr27 = get_base_predictions(deep_models, X_tr, rf_model=rf27)
     print("Meta-feature shape:", meta_X_tr27.shape)
 
-    Xm_tr27, Xm_va27, ym_tr27, ym_va27 = train_test_split(
-        meta_X_tr27, lbl_tr27,
-        test_size=0.2, random_state=42, shuffle=False
-    )
+    Xm_tr27, Xm_va27, ym_tr27, ym_va27 = train_test_split(meta_X_tr27, lbl_tr27,test_size=0.2, random_state=42, shuffle=False)
     labels_meta27 = np.unique(ym_tr27)
     cw_meta_vals27 = compute_class_weight('balanced', classes=labels_meta27, y=ym_tr27)
     class_weight_meta27 = {int(c): float(w) for c, w in zip(labels_meta27, cw_meta_vals27)}
@@ -2437,20 +2705,9 @@ def run_ea27():
         class_weight_meta27.setdefault(c, 1.0)
 
     meta27 = build_meta_model(input_dim=meta_X_tr27.shape[1])
-    meta27.compile(
-        optimizer=Adam(learning_rate=1e-4),
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    meta27.fit(
-        Xm_tr27, ym_tr27,
-        validation_data=(Xm_va27, ym_va27),
-        epochs=params["epochs_ea27"],
-        batch_size=params["batch_size"],
-        class_weight=class_weight_meta27,
-        callbacks=[EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)],
-        verbose=1
-    )
+    meta27.compile(optimizer=Adam(learning_rate=1e-4),loss='sparse_categorical_crossentropy',metrics=['accuracy'])
+    meta27.fit(Xm_tr27, ym_tr27,validation_data=(Xm_va27, ym_va27),epochs=params["epochs_ea27"],batch_size=params["batch_size"],class_weight=class_weight_meta27,callbacks=[EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)],verbose=1
+)
 
     # 17) Save artifacts
     artifacts = {
@@ -2481,112 +2738,120 @@ LOOK_BACK      = CONFIG["parameters"]["look_back"]
 SYMBOL         = CONFIG["symbol"]
 
 def evaluate_ea22():
-    print("\n--- Evaluating EA22 ---")
+    print("\n--- Evaluating EA22 (calibrated) ---")
 
-    # 1) โหลดโมเดล + artifacts
     with custom_object_scope({'AttentionLayer': AttentionLayer, 'TCN': TCN}):
         meta22  = load_model("models/ea22/meta22.h5", compile=False,
                              custom_objects={'AttentionLayer': AttentionLayer, 'TCN': TCN})
+        # base models (เรียงลำดับเดียวกับตอนเทรน)
         m_lstm  = load_model("models/ea22/ea22_lstm.h5",       compile=False)
+        m_tuned = load_model("models/ea22/ea22_tuned_lstm.h5", compile=False)
         m_cnn   = load_model("models/ea22/ea22_cnn_lstm.h5",   compile=False)
         m_tcn   = load_model("models/ea22/ea22_tcn.h5",        compile=False)
         m_trans = load_model("models/ea22/ea22_transformer.h5", compile=False)
+        # NEW: stage-1/2
+        m1      = load_model("models/ea22/stage1_long_rest.h5", compile=False)
+        m2      = load_model("models/ea22/stage2_short_hold.h5", compile=False)
 
     rf22     = joblib.load("models/ea22/rf22.pkl")
     scaler22 = joblib.load("models/ea22/scaler22.pkl")
+    
+    try:
+        iso = joblib.load("models/ea22/iso_hold.pkl")
+        fitted_iso = True
+    except Exception:
+        iso = None
+        fitted_iso = False
 
-    # โหลดรายชื่อฟีเจอร์ที่บันทึกตอนฝึก
-    with open("models/ea22/feature_names_ea22.pkl", "rb") as f:
+    def calibrate(p):
+        p = np.nan_to_num(p, nan=0.5)
+        return iso.predict(p) if fitted_iso else p
+
+    with open("models/ea22/feature_names_ea22.pkl","rb") as f:
         saved_feats = pickle.load(f)
+    with open("models/ea22/thresholds.json","r") as f:
+        thr_conf = json.load(f)
+    hold_thr = float(thr_conf.get("hold_thr", 0.50))
+    long_thr = float(thr_conf.get("long_thr", 0.60))
 
-    # 2) เตรียม DataFrame (M5) ด้วย pipeline เดียวกับตอน train
-    df = load_csv(CONFIG["file_paths"]["M5"])  # index_col='time'
+    # --- build features + sequences (เหมือนเทรน) ---
+    df = load_csv(CONFIG["file_paths"]["M5"])
     df = calculate_indicators(df)
     df = calculate_support_resistance(df)
     df = add_additional_features(df)
     df = add_confirm_entry_feature(df)
     df = enrich_df_with_tick_orderbook(df, CONFIG["symbol"])
 
-    # 3) เติมคอลัมน์ที่ขาดให้ครบตาม saved_feats
-    for feat in saved_feats:
-        if feat not in df.columns:
-            df[feat] = 0.0
+    for c in saved_feats:
+        if c not in df.columns: df[c] = 0.0
+    X_raw = (df[saved_feats].ffill().bfill().fillna(0.0)).values.astype(np.float32)
+    X_scaled = scaler22.transform(X_raw).astype(np.float32)
 
-    # 4) สร้าง X_raw → scale (no PCA)
-    X_raw_df = df[saved_feats] \
-                    .fillna(method='ffill') \
-                    .fillna(method='bfill') \
-                    .fillna(0.0)
-    X_raw    = X_raw_df.values
-    X_scaled = scaler22.transform(X_raw)
-
-    # 5) หา threshold บน X_scaled
-    prices      = df['close'].values
-    desired_hold = 0.20
-    tol          = 0.005
-
-    thr_final = find_threshold_by_bisect(
-        X_scaled,                                   # ← ใช้ X_scaled แทน data_pca
-        prices,
-        look_back   = CONFIG["parameters"]["look_back"],
-        hold_bars   = CONFIG["parameters"]["max_hold_period"],
-        desired_hold= desired_hold,
-        tol         = tol
+    prices = df['close'].values
+    X_seq, y_onehot = create_labels_from_price(
+        X_scaled, prices,
+        look_back=CONFIG["parameters"]["look_back"],
+        hold_bars=CONFIG["parameters"]["max_hold_period"],
+        thr_short=None, thr_long=None  # ถ้าอยากคำนวณ metric จากราคา ให้ใส่ threshold เดิมของคุณ
     )
-    thr_short, thr_long = thr_final, thr_final
-    print(f"[Evaluate] ใช้ thr_final = {thr_final:.6f} เพื่อ Hold≈{desired_hold:.0%}")
+    y_true = np.argmax(y_onehot, axis=1)
 
-    # 6) สร้าง dataset ด้วย create_labels_from_price
-    X, y = create_labels_from_price(
-        X_scaled,                                   # ← ใช้ X_scaled
-        prices,
-        look_back  = CONFIG["parameters"]["look_back"],
-        hold_bars  = CONFIG["parameters"]["max_hold_period"],
-        thr_short  = thr_short,
-        thr_long   = thr_long
-    )
+    # --- Stage-1: Long vs Rest ---
+    p1 = m1.predict(X_seq, verbose=0)[:, 1]      # P(Long)
+    long_mask = p1 > long_thr
 
-    # 7) แยก validation set (20% ท้าย)
-    n_seq  = len(X)
-    n_test = int(n_seq * 0.2)
-    X_train, X_val = X[:-n_test], X[-n_test:]
-    y_train, y_val = y[:-n_test], y[-n_test:]
+    # --- Meta features & calibrated P(Hold) ---
+    base_models = [m_lstm, m_tuned, m_cnn, m_tcn, m_trans]
+    meta_X = get_base_predictions(base_models, X_seq, rf_model=rf22,
+                                  batch_size=CONFIG["parameters"]["batch_size"])
+    # sanity: มิติต้องเท่ากับ meta22.input_shape[-1]
+    assert meta_X.shape[1] == meta22.input_shape[-1]
 
-    labels_va = np.argmax(y_val, axis=1)
-    print("Validation support (Short, Hold, Long):",
-          np.unique(labels_va, return_counts=True))
+    prob_meta   = meta22.predict(meta_X, verbose=0)    # (n,3)
+    P_hold_cal  = iso.predict(np.nan_to_num(prob_meta[:,1], nan=0.5))
 
-    # 8) ทำ stacking & predict
-    base_models = [m_lstm, m_cnn, m_tcn, m_trans]
-    meta_inputs = get_base_predictions(base_models, X_val, rf_model=rf22)
+    p_long = m1.predict(X_seq, verbose=0)[:,1]
+    long_mask = p_long > float(thr_conf.get("long_thr", 0.60))
 
-    y_true = np.argmax(y_val, axis=1)
-    y_pred = np.argmax(meta22.predict(meta_inputs), axis=1)
+    rest_idx   = np.where(~long_mask)[0]
+    # --- Stage-2: Short vs Hold เฉพาะที่เหลือจาก Rest ---
+    final_pred = np.zeros(len(X_seq), dtype=int)       # default=Short
+    final_pred[long_mask] = 2
 
-    print("EA22 Accuracy:", accuracy_score(y_true, y_pred))
-    print(classification_report(
-        y_true, y_pred,
-        labels=[0,1,2],
-        target_names=['Short','Hold','Long'],
-        zero_division=0
-    ))
-    print("Confusion Matrix:\n", confusion_matrix(y_true, y_pred))
+    if len(rest_idx) > 0:
+        # วิธี A (ตรงกับแนวคิดตอนเทรน): ใช้ m2 เป็นตัวตัดสินฐาน แล้วใช้ calibrator เป็นเกณฑ์
+        p_hold_m2 = m2.predict(X_seq[rest_idx], verbose=0)[:,1]
+        p_hold = 0.5*P_hold_cal[rest_idx] + 0.5*p_hold_m2
+        final_pred[rest_idx] = (p_hold > hold_thr).astype(int)
 
-    return df, y_pred
+    # --- Metrics/plots ---
+    print("EA22 Accuracy:", accuracy_score(y_true, final_pred))
+    print(classification_report(y_true, final_pred, labels=[0,1,2],
+                                target_names=['Short','Hold','Long'], zero_division=0))
+    print("Confusion Matrix:\n", confusion_matrix(y_true, final_pred, labels=[0,1,2]))
 
-def backtest_signals(prices: np.ndarray, signals: np.ndarray, hold_period: int) -> np.ndarray:
+    frac_pos, mean_pred = calibration_curve((y_true==1).astype(int), P_hold_cal, n_bins=10)
+    plt.figure(figsize=(5,5)); plt.plot(mean_pred, frac_pos, "s-", label="Calibrated")
+    plt.plot([0,1],[0,1],"k--", label="Perfect"); plt.grid(True); plt.legend(); plt.title("Reliability — Hold"); plt.show()
+
+    return df, final_pred
+
+def backtest_signals(prices: np.ndarray, signals: np.ndarray, hold_period: int, cost_bps: float = 0.0) -> np.ndarray:
     returns = []
+    c = cost_bps / 10000.0
     for i, sig in enumerate(signals):
         if i + hold_period >= len(prices):
             break
         if sig == 2:       # long
-            ret = prices[i + hold_period] / prices[i] - 1
+            ret = prices[i + hold_period] / prices[i] - 1.0
+            ret -= c
         elif sig == 0:     # short
-            ret = prices[i] / prices[i + hold_period] - 1
+            ret = prices[i] / prices[i + hold_period] - 1.0
+            ret -= c
         else:              # hold
             ret = 0.0
         returns.append(ret)
-    return np.array(returns)
+    return np.array(returns, dtype=np.float64)
 
 # ───────────────────────────────────────────────────────
 # Execute evaluation + backtest
@@ -2598,6 +2863,8 @@ if __name__ == "__main__":
         raise RuntimeError("MT5 initialization failed")
     try:
         run_ea22()
+    except (DLLLoadError, InsufficientDataError) as e:
+        logger.error("EA22 failed: %s", e)
     finally:
         mt5.shutdown()
 
@@ -2633,11 +2900,7 @@ def evaluate_ea27():
     df_m5 = prepare_base_dataframe(CONFIG["file_paths"]["M5"], CONFIG["symbol"], dfs_other={'M15': data['M15'], 'H1': data['H1']})
     df_m15 = prepare_base_dataframe(CONFIG["file_paths"]["M15"], CONFIG["symbol"], dfs_other={})
     df_h1 = prepare_base_dataframe(CONFIG["file_paths"]["H1"], CONFIG["symbol"], dfs_other={})
-    df27 = (
-        df_m5
-        .join(df_m15.add_suffix("_M15"), how="left").fillna(method='ffill')
-        .join(df_h1.add_suffix("_H1"), how="left").fillna(method='ffill')
-    )
+    df27 = (df_m5.join(df_m15.add_suffix("_M15"), how="left").fillna(method='ffill').join(df_h1.add_suffix("_H1"), how="left").fillna(method='ffill'))
 
     # Feature transform
     X_raw27 = df27[features_ea27].dropna().values
@@ -2645,13 +2908,7 @@ def evaluate_ea27():
     X_pca27 = pca27.transform(X_scaled27)
 
     # สร้าง dataset hold-out
-    X27, y27 = create_labels_from_price(
-        df27,
-        look_back=CONFIG["parameters"]["look_back"],
-        hold_bars=CONFIG["parameters"]["max_hold_period"],
-        thr_short=thr_short27,
-        thr_long=thr_long27
-    )
+    X27, y27 = create_labels_from_price(df27,look_back=CONFIG["parameters"]["look_back"],hold_bars=CONFIG["parameters"]["max_hold_period"],thr_short=thr_short27,thr_long=thr_long27)
     _, X_val27, _, y_val27 = train_test_split(X27, y27, test_size=0.2, random_state=42, shuffle=False)
     print("Eval classes:", np.unique(np.argmax(y_val27, axis=1)))
 
@@ -2670,13 +2927,6 @@ def evaluate_ea27():
 # ====================================
 # 🎯 Section 6c: Updated main()
 # ====================================
-def main():
-    if not mt5.initialize():
-        raise RuntimeError("MT5 initialization failed")
-    try:
-        run_ea22()
-    finally:
-        mt5.shutdown()
 
 if __name__ == "__main__":
     main()
