@@ -13,7 +13,6 @@ import MetaTrader5 as mt5
 import tensorflow as tf
 import talib
 from typing import Dict
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.model_selection import TimeSeriesSplit
@@ -890,7 +889,6 @@ from hmmlearn.hmm import GaussianHMM
 from typing import Optional
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, StratifiedKFold
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import Dense, Dropout, Input, Conv1D, MaxPooling1D, Flatten, Add
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
@@ -1111,11 +1109,11 @@ def cross_validate_ea22(
         embargo = look_back  # กันไว้ขั้นต่ำ
 
     y_lbl = np.argmax(y, axis=1)
-    skf   = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
 
     accs, f1_hold_list, f1_macro_list = [], [], []
 
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y_lbl), start=1):
+    for fold, (tr_idx, va_idx) in enumerate(tscv.split(X, y_lbl), start=1):
         print(f"\n[EA22 CV] Fold {fold}/{n_splits} tr={len(tr_idx)} va={len(va_idx)}")
 
         # ---------- สร้าง slice ของ fold นี้ ----------
@@ -1932,13 +1930,17 @@ def run_ea22():
     X_tmp, y_tmp, hold_frac_all = make_labels(best_thr)
     print(f"[LABEL] picked thr={best_thr:.6f} → Hold frac={hold_frac_all:.2%}")
 
-    # 4) split (ห้าม dummy/oversample)
-    X_tr, X_va, y_tr, y_va = train_test_split(
-        X_tmp, y_tmp, test_size=0.2, shuffle=False, random_state=42
-    )
-
-    print("[SPLIT] train:", np.unique(np.argmax(y_tr,axis=1), return_counts=True),
-          "val:", np.unique(np.argmax(y_va,axis=1), return_counts=True))
+    # 4) time-series cross-validation (ห้าม dummy/oversample)
+    tscv = TimeSeriesSplit(n_splits=5)
+    fold_metrics = []
+    for tr_idx, va_idx in tscv.split(X_tmp):
+        X_tr, X_va = X_tmp[tr_idx], X_tmp[va_idx]
+        y_tr, y_va = y_tmp[tr_idx], y_tmp[va_idx]
+        print("[SPLIT] train:", np.unique(np.argmax(y_tr,axis=1), return_counts=True),
+              "val:", np.unique(np.argmax(y_va,axis=1), return_counts=True))
+        # model.fit(X_tr, y_tr)
+        # fold_metrics.append(model.evaluate(X_va, y_va))
+    # print("Mean metric across folds:", np.mean(fold_metrics))
 
     with open("models/ea22/labeling.json", "w") as f:
         json.dump({
@@ -2610,11 +2612,17 @@ def run_ea27():
     cv27_scores = cross_validate_ea22(X_res, y_res,build_base_fns=base_fns27,build_rf_fn=build_rf_model,build_meta_fn=build_meta_model,look_back=params["look_back"],batch_size=params["batch_size"],epochs=params["epochs_ea27"],n_splits=5)
     print(f"[EA27 CV] Mean accuracy: {np.mean(cv27_scores):.4f} ± {np.std(cv27_scores):.4f}")
 
-    # 9) train/val split สุดท้าย
-    X_tr, X_va, y_tr, y_va = train_test_split(X_res, y_res, test_size=0.2, random_state=42, shuffle=False)
+    # 9) time-series cross-validation สุดท้าย
+    tscv_final = TimeSeriesSplit(n_splits=5)
+    final_scores = []
+    for tr_idx, va_idx in tscv_final.split(X_res):
+        X_tr, X_va = X_res[tr_idx], X_res[va_idx]
+        y_tr, y_va = y_res[tr_idx], y_res[va_idx]
+        final_scores.append(train_and_evaluate(X_tr, y_tr, X_va, y_va))
+    print("Mean final score:", np.mean(final_scores))
 
     # 10) คำนวณ class_weight แบบ multi-class
-    labels_res = np.argmax(y_tr, axis=1)
+    labels_res = np.argmax(y_res, axis=1)
     classes = np.array([0,1,2])
     cw_list = compute_class_weight('balanced', classes=classes, y=labels_res)
     class_weight_multi = {int(c): float(w) for c, w in zip(classes, cw_list)}
@@ -2697,9 +2705,15 @@ def run_ea27():
     meta_X_tr27 = get_base_predictions(deep_models, X_tr, rf_model=rf27)
     print("Meta-feature shape:", meta_X_tr27.shape)
 
-    Xm_tr27, Xm_va27, ym_tr27, ym_va27 = train_test_split(meta_X_tr27, lbl_tr27,test_size=0.2, random_state=42, shuffle=False)
-    labels_meta27 = np.unique(ym_tr27)
-    cw_meta_vals27 = compute_class_weight('balanced', classes=labels_meta27, y=ym_tr27)
+    tscv_meta = TimeSeriesSplit(n_splits=5)
+    meta_scores = []
+    for tr_idx, va_idx in tscv_meta.split(meta_X_tr27):
+        Xm_tr27, Xm_va27 = meta_X_tr27[tr_idx], meta_X_tr27[va_idx]
+        ym_tr27, ym_va27 = lbl_tr27[tr_idx], lbl_tr27[va_idx]
+        meta_scores.append(train_and_evaluate_meta(Xm_tr27, ym_tr27, Xm_va27, ym_va27))
+    print("Mean meta score:", np.mean(meta_scores))
+    labels_meta27 = np.unique(lbl_tr27)
+    cw_meta_vals27 = compute_class_weight('balanced', classes=labels_meta27, y=lbl_tr27)
     class_weight_meta27 = {int(c): float(w) for c, w in zip(labels_meta27, cw_meta_vals27)}
     for c in [0,1,2]:
         class_weight_meta27.setdefault(c, 1.0)
@@ -2909,19 +2923,23 @@ def evaluate_ea27():
 
     # สร้าง dataset hold-out
     X27, y27 = create_labels_from_price(df27,look_back=CONFIG["parameters"]["look_back"],hold_bars=CONFIG["parameters"]["max_hold_period"],thr_short=thr_short27,thr_long=thr_long27)
-    _, X_val27, _, y_val27 = train_test_split(X27, y27, test_size=0.2, random_state=42, shuffle=False)
-    print("Eval classes:", np.unique(np.argmax(y_val27, axis=1)))
+    tscv_eval = TimeSeriesSplit(n_splits=5)
+    eval_acc = []
+    for _, val_idx in tscv_eval.split(X27):
+        X_val27, y_val27 = X27[val_idx], y27[val_idx]
+        print("Eval classes:", np.unique(np.argmax(y_val27, axis=1)))
 
-    # stacking + predict
-    base_models27 = [m_lstm27, m_cnn27, m_tcn27, m_trans27]
-    meta_inputs27 = get_base_predictions(base_models27, X_val27, rf_model=rf27)
+        # stacking + predict
+        base_models27 = [m_lstm27, m_cnn27, m_tcn27, m_trans27]
+        meta_inputs27 = get_base_predictions(base_models27, X_val27, rf_model=rf27)
 
-    y_true27 = np.argmax(y_val27, axis=1)
-    y_pred27 = np.argmax(meta27.predict(meta_inputs27), axis=1)
+        y_true27 = np.argmax(y_val27, axis=1)
+        y_pred27 = np.argmax(meta27.predict(meta_inputs27), axis=1)
 
-    print("EA27 Accuracy:", accuracy_score(y_true27, y_pred27))
-    print(classification_report(y_true27, y_pred27, labels=[0,1,2], target_names=['Short','Hold','Long'], zero_division=0))
-    print("Confusion Matrix:\n", confusion_matrix(y_true27, y_pred27))
+        eval_acc.append(accuracy_score(y_true27, y_pred27))
+        print(classification_report(y_true27, y_pred27, labels=[0,1,2], target_names=['Short','Hold','Long'], zero_division=0))
+        print("Confusion Matrix:\n", confusion_matrix(y_true27, y_pred27))
+    print("EA27 Accuracy:", np.mean(eval_acc))
     return df27, y_pred27
     
 # ====================================
@@ -2929,4 +2947,3 @@ def evaluate_ea27():
 # ====================================
 
 if __name__ == "__main__":
-    main()
